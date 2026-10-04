@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# awg-quick strip: убирает ключи, которые понимает только awg-quick
+[ "$1" = "strip" ] && grep -vE '^\s*(Address|DNS|MTU)\s*=' "$2"

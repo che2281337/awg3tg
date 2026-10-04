@@ -1,0 +1,11 @@
+services:
+  awg-bot:
+    build: .
+    container_name: awg-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /app/data/bot.db
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data

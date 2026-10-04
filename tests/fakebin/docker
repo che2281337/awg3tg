@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Поддельный docker для тестов: «контейнер» — это каталог $FAKE_ROOT.
+set -e
+case "$1" in
+  ps) echo "some-other"; echo "amnezia-awg2" ;;
+  exec)
+    shift
+    [ "$1" = "-i" ] && shift
+    shift            # имя контейнера
+    shift; shift     # bash -c
+    script="${1//\/opt\/amnezia/$FAKE_ROOT/opt/amnezia}"
+    PATH="$(dirname "$0"):$PATH" exec bash -c "$script"
+    ;;
+  *) echo "unsupported: $*" >&2; exit 1 ;;
+esac
