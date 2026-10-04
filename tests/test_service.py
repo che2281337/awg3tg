@@ -223,3 +223,22 @@ async def test_reminders_and_expiry_notifications(svc, fake_container):
     # после продления напоминания снова работают
     await svc.extend(10, 1)
     assert (await svc.db.get_user(10)).notified == 0
+
+
+async def test_mock_server(tmp_path):
+    from bot.awg.mock import MockAwgServer
+
+    settings = Settings(bot_token="x", server_host="127.0.0.1", db_path=str(tmp_path / "bot.db"))
+    db = Database(settings.db_path)
+    await db.connect()
+    service = VpnService(settings, db, MockAwgServer(str(tmp_path / "mock")))
+    await service.start()
+    user, _ = await db.touch_user(10, "u", "U")
+    await service.extend(10, 30, devices=2)
+    rk = await service.create_device(user, "📱 Телефон")
+    assert "HeaderProtectionKey" in rk.conf and rk.key.ip == "10.8.1.1"
+    for _ in range(5):
+        await service.collect_traffic()
+    await service.delete_device(rk.key)
+    assert rk.key.public_key not in (tmp_path / "mock/opt/amnezia/awg/awg0.conf").read_text()
+    await db.close()

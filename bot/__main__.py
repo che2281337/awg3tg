@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -9,6 +10,7 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
+from .awg.mock import MockAwgServer
 from .awg.server import AwgServer
 from .config import Settings
 from .db import Database
@@ -39,13 +41,17 @@ async def main() -> None:
     db = Database(settings.db_path)
     await db.connect()
 
-    server = AwgServer(
-        container=settings.awg_container,
-        config_path=settings.awg_config_path,
-        interface=settings.awg_interface,
-        binary=settings.awg_bin,
-        docker=settings.docker_bin,
-    )
+    if settings.awg_mock:
+        server: AwgServer = MockAwgServer(os.path.join(os.path.dirname(settings.db_path) or ".", "mock-server"))
+        settings.server_host = settings.server_host or "127.0.0.1"
+    else:
+        server = AwgServer(
+            container=settings.awg_container,
+            config_path=settings.awg_config_path,
+            interface=settings.awg_interface,
+            binary=settings.awg_bin,
+            docker=settings.docker_bin,
+        )
     service = VpnService(settings, db, server)
     await service.start()
 

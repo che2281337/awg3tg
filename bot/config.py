@@ -46,6 +46,9 @@ class Settings:
     # Фоновые задачи
     stats_interval: int = 300
 
+    # Демо-режим без VPN-сервера (см. bot/awg/mock.py)
+    awg_mock: bool = False
+
     @classmethod
     def from_env(cls) -> "Settings":
         load_dotenv()
@@ -76,4 +79,5 @@ class Settings:
             ref_bonus_days=_int("REF_BONUS_DAYS", 7),
             default_devices=_int("DEFAULT_DEVICES", 1),
             stats_interval=max(60, _int("STATS_INTERVAL", 300)),
+            awg_mock=os.getenv("AWG_MOCK", "").strip().lower() in ("1", "true", "yes", "on"),
         )
