@@ -1,69 +1,79 @@
 from __future__ import annotations
 
-import html
 import logging
+from typing import Any, Awaitable, Callable
 
-from aiogram import Bot
-from aiogram.types import BufferedInputFile, KeyboardButton, ReplyKeyboardMarkup
-from aiogram.types import User as TgUser
+from aiogram import BaseMiddleware, Bot
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message, TelegramObject
 
-from ..config import Settings
-from ..db import Database, User
-from ..service import RenderedKey
+from ..db import Database
+from ..service import RenderedKey, VpnService
+from ..utils import esc
 
 log = logging.getLogger(__name__)
 
-BTN_GET = "🔑 Получить ключ"
-BTN_MY = "📋 Мои ключи"
-BTN_HELP = "❓ Как подключиться"
-
 MAX_TEXT = 4000
 
-HELP_TEXT = (
-    "<b>Как подключиться</b>\n\n"
-    "1. Установите <b>AmneziaVPN</b> (5.0.1.5 или новее — нужна поддержка AmneziaWG 3.x): "
-    "https://amnezia.org/downloads или из магазина приложений.\n"
-    "2. Нажмите «🔑 Получить ключ» и скопируйте ключ <code>vpn://…</code>.\n"
-    "3. В AmneziaVPN: <b>➕ / «Добавить сервер»</b> → «Вставить ключ» (или «Файл с настройками» "
-    "для .conf, или «QR-код»).\n"
-    "4. Подключитесь.\n\n"
-    "Файл <b>.conf</b> подходит и для приложения <b>AmneziaWG</b>, если оно поддерживает AmneziaWG 3.x.\n"
-    "Не передавайте ключ другим людям: один ключ — одно устройство."
-)
 
-
-def main_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BTN_GET)], [KeyboardButton(text=BTN_MY), KeyboardButton(text=BTN_HELP)]],
-        resize_keyboard=True,
+def help_text(support: str) -> str:
+    text = (
+        "<b>Как подключиться</b>\n\n"
+        "1. Установите <b>AmneziaVPN</b> 5.0.1.5 или новее: https://amnezia.org/downloads "
+        "(или из App Store / Google Play).\n"
+        "2. Оформите подписку или пробный период в разделе «💳 Тарифы».\n"
+        "3. В «🔑 Мои устройства» добавьте устройство — придёт ключ <code>vpn://…</code>, файл и QR-код.\n"
+        "4. В AmneziaVPN: <b>«Добавить сервер» → «Вставить ключ»</b> (или «Файл с настройками» / «QR-код»).\n"
+        "5. Подключитесь.\n\n"
+        "Один ключ — одно устройство. Для телефона и компьютера добавьте отдельные устройства.\n"
+        "Если подписка закончилась, ключи отключаются, а после продления снова работают — "
+        "заново ничего настраивать не нужно."
     )
+    if support:
+        text += f"\n\nПоддержка: {esc(support)}"
+    return text
 
 
-def is_admin(settings: Settings, tg_id: int) -> bool:
-    return tg_id in settings.admin_ids
+class UserMiddleware(BaseMiddleware):
+    """Создаёт аккаунт при первом обращении, обновляет last_seen, отсекает забаненных."""
+
+    def __init__(self, db: Database, service: VpnService) -> None:
+        self.db = db
+        self.service = service
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        tg_user = getattr(event, "from_user", None)
+        if tg_user is None or tg_user.is_bot:
+            return await handler(event, data)
+        user, created = await self.db.touch_user(tg_user.id, tg_user.username, tg_user.full_name)
+        data["user"] = user
+        data["is_new"] = created
+        data["is_admin"] = self.service.is_admin(user.tg_id)
+        if user.banned and not data["is_admin"]:
+            if isinstance(event, CallbackQuery):
+                await event.answer("⛔ Аккаунт заблокирован", show_alert=True)
+            elif isinstance(event, Message):
+                await event.answer("⛔ Ваш аккаунт заблокирован. Обратитесь к администратору.")
+            return None
+        return await handler(event, data)
 
 
-def user_title(u: TgUser) -> str:
-    return f"@{u.username}" if u.username else u.full_name
-
-
-def esc(text: str | None) -> str:
-    return html.escape(text or "")
-
-
-async def ensure_user(db: Database, settings: Settings, tg_user: TgUser) -> tuple[User, bool]:
-    """Регистрирует пользователя. Возвращает (user, создан_ли_только_что)."""
-    existing = await db.get_user(tg_user.id)
-    if existing is None:
-        status = "approved" if settings.access_mode == "open" or is_admin(settings, tg_user.id) else "pending"
-    else:
-        status = existing.status
-    user = await db.upsert_user(tg_user.id, tg_user.username, tg_user.full_name, status)
-    return user, existing is None
-
-
-def can_use(settings: Settings, user: User) -> bool:
-    return is_admin(settings, user.tg_id) or user.status == "approved"
+async def edit_or_send(call: CallbackQuery, text: str, kb: InlineKeyboardMarkup | None = None) -> None:
+    """Редактирует сообщение с кнопками; если нельзя (фото, старое) — шлёт новое."""
+    msg = call.message
+    try:
+        if isinstance(msg, Message) and msg.text is not None:
+            await msg.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+            return
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            return
+    await call.bot.send_message(call.from_user.id, text, reply_markup=kb, disable_web_page_preview=True)
 
 
 async def send_long(bot: Bot, chat_id: int, text: str, **kwargs) -> None:
@@ -79,8 +89,8 @@ async def send_long(bot: Bot, chat_id: int, text: str, **kwargs) -> None:
 
 
 async def deliver_key(bot: Bot, chat_id: int, rk: RenderedKey) -> None:
-    header = f"🔑 Ключ <b>{esc(rk.key.name)}</b> (IP {rk.key.ip})\n\n"
-    instruction = "Скопируйте ключ и вставьте его в AmneziaVPN (➕ → «Вставить ключ»):\n\n"
+    header = f"🔑 <b>{esc(rk.key.name)}</b>\n\n"
+    instruction = "Скопируйте ключ (нажмите на него) и вставьте в AmneziaVPN → «Добавить сервер» → «Вставить ключ»:\n\n"
     body = f"<code>{esc(rk.vpn_url)}</code>"
     if len(header) + len(instruction) + len(body) <= MAX_TEXT:
         await bot.send_message(chat_id, header + instruction + body)
@@ -89,7 +99,6 @@ async def deliver_key(bot: Bot, chat_id: int, rk: RenderedKey) -> None:
         await bot.send_document(
             chat_id, BufferedInputFile(rk.vpn_url.encode(), filename="amnezia-key.txt"), caption="Ключ vpn://"
         )
-
     await bot.send_document(
         chat_id,
         BufferedInputFile(rk.conf.encode(), filename=rk.filename),
@@ -97,6 +106,12 @@ async def deliver_key(bot: Bot, chat_id: int, rk: RenderedKey) -> None:
     )
     png = rk.qr_png()
     if png:
-        await bot.send_photo(
-            chat_id, BufferedInputFile(png, filename="qr.png"), caption="QR-код для сканирования в приложении"
-        )
+        await bot.send_photo(chat_id, BufferedInputFile(png, filename="qr.png"), caption="QR-код для сканирования")
+
+
+async def notify_admins(bot: Bot, service: VpnService, text: str, **kwargs) -> None:
+    for admin_id in service.settings.admin_ids:
+        try:
+            await bot.send_message(admin_id, text, **kwargs)
+        except Exception:
+            log.warning("Не удалось уведомить админа %s", admin_id)

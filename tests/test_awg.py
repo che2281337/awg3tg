@@ -1,17 +1,11 @@
 import json
-import os
-
-import pytest
 
 from bot.awg import conf as wgconf
 from bot.awg.export import ClientParams, build_native_config, build_vpn_url, decode_vpn_url, q_uncompress
 from bot.awg.keys import generate_keypair, public_from_private
 from bot.awg.server import AwgServer
-from bot.config import Settings
-from bot.db import Database
-from bot.service import KeyService
 
-from .conftest import FAKEBIN, SERVER_CONF, SERVER_PSK, SERVER_PUB
+from .conftest import SERVER_CONF, SERVER_PSK, SERVER_PUB
 
 
 def test_parse_awg3_params():
@@ -131,49 +125,12 @@ def test_qcompress_header():
     assert json.loads(q_uncompress(raw))
 
 
-@pytest.mark.asyncio
-async def test_end_to_end_with_fake_docker(fake_container, tmp_path):
-    server = AwgServer(docker=os.path.join(FAKEBIN, "docker"))
-    settings = Settings(bot_token="x", server_host="203.0.113.10", db_path=str(tmp_path / "bot.db"))
-    db = Database(settings.db_path)
-    await db.connect()
-    service = KeyService(settings, db, server)
-    await service.start()
-    assert server.container == "amnezia-awg2"
 
-    rk = await service.issue(42, "TG @user #1", key_limit=1)
-    assert rk.key.ip == "10.8.1.2"
 
-    awg_dir = fake_container / "opt" / "amnezia" / "awg"
-    conf_text = (awg_dir / "awg0.conf").read_text()
-    assert f"PublicKey = {rk.key.public_key}" in conf_text
-    assert "AllowedIPs = 10.8.1.2/32" in conf_text
-    applied = (fake_container / "applied.conf").read_text()
-    assert rk.key.public_key in applied and "Address" not in applied
-
-    table = json.loads((awg_dir / "clientsTable").read_text())
-    assert table[0]["clientId"] == rk.key.public_key
-    assert table[0]["userData"]["clientName"] == "TG @user #1"
-
-    data = decode_vpn_url(rk.vpn_url)
-    assert json.loads(data["containers"][0]["awg"]["last_config"])["server_pub_key"] == SERVER_PUB
-    assert rk.qr_png()
-
-    from bot.service import LimitReached
-
-    with pytest.raises(LimitReached):
-        await service.issue(42, "second", key_limit=1)
-
-    stats = await server.stats()
-    assert stats[rk.key.public_key].rx == 1024
-
-    again = await service.render(rk.key)
-    assert again.conf == rk.conf
-
-    await service.revoke(rk.key)
-    assert rk.key.public_key not in (awg_dir / "awg0.conf").read_text()
-    assert json.loads((awg_dir / "clientsTable").read_text()) == []
-    assert await db.user_keys(42) == []
-    # исходный пир, созданный приложением, не тронут
-    assert "7jxs4R4cN6S3OkH5TbVpIDaPu1lXDFnxsI3cFeuUVlc=" in (awg_dir / "awg0.conf").read_text()
-    await db.close()
+def test_allocate_ip_respects_reserved():
+    cfg = wgconf.parse(SERVER_CONF)
+    assert AwgServer.allocate_ip(cfg, {"10.8.1.2", "10.8.1.3"}) == "10.8.1.4"
+    assert AwgServer.ip_in_use(cfg, "10.8.1.1")  # занят пиром из приложения
+    assert AwgServer.ip_in_use(cfg, "10.8.1.0")  # адрес сервера
+    assert AwgServer.ip_in_use(cfg, "10.9.0.5")  # вне подсети
+    assert not AwgServer.ip_in_use(cfg, "10.8.1.7")

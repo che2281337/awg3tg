@@ -203,9 +203,19 @@ class AwgServer:
         return cls._interface_address(cfg).network
 
     @classmethod
-    def allocate_ip(cls, cfg: wgconf.WgConfig) -> str:
+    def ip_in_use(cls, cfg: wgconf.WgConfig, ip: str) -> bool:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return True
         iface = cls._interface_address(cfg)
-        used = {iface.ip}
+        if addr == iface.ip or addr not in iface.network:
+            return True
+        return addr in cls._used_ips(cfg, iface)
+
+    @staticmethod
+    def _used_ips(cfg: wgconf.WgConfig, iface: ipaddress.IPv4Interface) -> set:
+        used = set()
         for peer in cfg.peers:
             for allowed in peer.get_all("AllowedIPs"):
                 for part in allowed.split(","):
@@ -215,6 +225,18 @@ class AwgServer:
                         continue
                     if isinstance(net, ipaddress.IPv4Network) and net.subnet_of(iface.network):
                         used.update(net)
+        return used
+
+    @classmethod
+    def allocate_ip(cls, cfg: wgconf.WgConfig, reserved: set[str] | frozenset[str] = frozenset()) -> str:
+        """Первый свободный адрес; `reserved` — адреса отключённых ключей из БД."""
+        iface = cls._interface_address(cfg)
+        used = {iface.ip} | cls._used_ips(cfg, iface)
+        for r in reserved:
+            try:
+                used.add(ipaddress.ip_address(r))
+            except ValueError:
+                pass
         for host in iface.network.hosts():
             if host not in used:
                 return str(host)
@@ -248,12 +270,25 @@ class AwgServer:
 
     # ---------- публичное API ----------
 
-    async def add_peer(self, client_name: str) -> tuple[NewPeer, ServerInfo]:
+    async def add_peer(
+        self,
+        client_name: str,
+        *,
+        keypair: tuple[str, str] | None = None,
+        ip: str | None = None,
+        reserved: set[str] | frozenset[str] = frozenset(),
+    ) -> tuple[NewPeer, ServerInfo]:
+        """Добавляет пира. С `keypair`/`ip` — восстанавливает ранее отключённый ключ:
+        если его адрес за это время заняли, выделяется новый."""
         async with self._lock:
             cfg = await self.load_config()
             info = await self.server_info(cfg)
-            private_key, public_key = generate_keypair()
-            ip = self.allocate_ip(cfg)
+            private_key, public_key = keypair or generate_keypair()
+            if cfg.find_peer(public_key) is not None:
+                peer_ip = (cfg.find_peer(public_key).get("AllowedIPs") or "").split("/")[0]
+                return NewPeer(private_key, public_key, peer_ip or ip or ""), info
+            if not ip or self.ip_in_use(cfg, ip):
+                ip = self.allocate_ip(cfg, reserved)
             cfg.add_peer(public_key, info.preshared_key, f"{ip}/32")
             await self.write_file(self.config_path, cfg.dump())
             await self.apply()
