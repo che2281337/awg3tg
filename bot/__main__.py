@@ -15,7 +15,7 @@ from .awg.server import AwgServer
 from .config import Settings
 from .db import Database
 from .handlers import admin, user
-from .handlers.common import UserMiddleware
+from .handlers.common import ThrottleMiddleware, UserMiddleware
 from .scheduler import start_background
 from .service import VpnService
 from .utils import set_timezone
@@ -23,6 +23,9 @@ from .utils import set_timezone
 
 def build_dispatcher(settings: Settings, db: Database, service: VpnService) -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage(), settings=settings, db=db, service=service)
+    throttle = ThrottleMiddleware(service)
+    dp.message.outer_middleware(throttle)
+    dp.callback_query.outer_middleware(throttle)
     mw = UserMiddleware(db, service)
     dp.message.outer_middleware(mw)
     dp.callback_query.outer_middleware(mw)

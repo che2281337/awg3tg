@@ -35,6 +35,9 @@ from .keyboards import (
 log = logging.getLogger(__name__)
 router = Router(name="user")
 
+# Сколько неподтверждённых заявок на оплату может висеть у одного пользователя
+MAX_PENDING_PAYMENTS = 2
+
 
 class UserStates(StatesGroup):
     device_name = State()
@@ -434,7 +437,14 @@ async def cb_buy_plan(call: CallbackQuery, callback_data: Buy, db: Database, ser
 
 
 @router.callback_query(Buy.filter(F.action == "paid"))
-async def cb_buy_paid(call: CallbackQuery, callback_data: Buy, state: FSMContext) -> None:
+async def cb_buy_paid(call: CallbackQuery, callback_data: Buy, state: FSMContext, db: Database, user: User) -> None:
+    plan = await db.get_plan(callback_data.plan_id)
+    if plan is None or not plan.active:
+        await call.answer("Тариф недоступен", show_alert=True)
+        return
+    if await db.pending_count(user.tg_id) >= MAX_PENDING_PAYMENTS:
+        await call.answer("У вас уже есть заявки на проверке. Дождитесь решения администратора.", show_alert=True)
+        return
     await call.answer()
     await state.set_state(UserStates.receipt)
     await state.update_data(plan_id=callback_data.plan_id)
@@ -457,8 +467,12 @@ async def st_receipt(
     data = await state.get_data()
     plan = await db.get_plan(data.get("plan_id", 0))
     await state.clear()
-    if plan is None:
+    # Проверяем ещё раз: callback_data можно подделать и подсунуть скрытый тариф.
+    if plan is None or not plan.active:
         await message.answer("Тариф не найден, выберите его заново в «💳 Тарифы».")
+        return
+    if await db.pending_count(user.tg_id) >= MAX_PENDING_PAYMENTS:
+        await message.answer("У вас уже есть заявки на проверке. Дождитесь решения администратора.")
         return
     if message.photo:
         rtype, receipt = "photo", message.photo[-1].file_id

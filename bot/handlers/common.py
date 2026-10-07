@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, Bot
@@ -60,6 +61,34 @@ class UserMiddleware(BaseMiddleware):
             elif isinstance(event, Message):
                 await event.answer("⛔ Ваш аккаунт заблокирован. Обратитесь к администратору.")
             return None
+        return await handler(event, data)
+
+
+class ThrottleMiddleware(BaseMiddleware):
+    """Анти-флуд: не чаще одного действия в `rate` секунд от пользователя (админов не ограничивает)."""
+
+    def __init__(self, service: VpnService, rate: float = 0.5) -> None:
+        self.service = service
+        self.rate = rate
+        self._last: dict[int, float] = {}
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        tg_user = getattr(event, "from_user", None)
+        if tg_user is not None and not self.service.is_admin(tg_user.id):
+            now_ = time.monotonic()
+            if now_ - self._last.get(tg_user.id, 0.0) < self.rate:
+                if isinstance(event, CallbackQuery):
+                    await event.answer("Слишком часто, подождите секунду")
+                return None
+            self._last[tg_user.id] = now_
+            if len(self._last) > 10000:  # не копим память бесконечно
+                border = now_ - 60
+                self._last = {k: v for k, v in self._last.items() if v > border}
         return await handler(event, data)
 
 

@@ -490,6 +490,9 @@ class Database:
     async def pending_payments(self) -> list[Payment]:
         return await self._all(Payment, "SELECT * FROM payments WHERE status = 'pending' ORDER BY id")
 
+    async def pending_count(self, tg_id: int) -> int:
+        return await self._scalar("SELECT COUNT(*) FROM payments WHERE tg_id = ? AND status = 'pending'", (tg_id,)) or 0
+
     async def user_payments(self, tg_id: int, limit: int = 10) -> list[Payment]:
         return await self._all(
             Payment, "SELECT * FROM payments WHERE tg_id = ? ORDER BY id DESC LIMIT ?", (tg_id, limit)
