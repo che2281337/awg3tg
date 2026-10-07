@@ -28,9 +28,24 @@ CREATE TABLE IF NOT EXISTS users (
     notified     INTEGER NOT NULL DEFAULT 0,  -- этап напоминаний об окончании
     ref_rewarded INTEGER NOT NULL DEFAULT 0   -- пригласивший уже получил бонус
 );
+CREATE TABLE IF NOT EXISTS servers (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,                -- «Германия»
+    flag       TEXT NOT NULL DEFAULT '🌐',
+    host       TEXT NOT NULL,                -- публичный IP/домен для Endpoint
+    conn       TEXT NOT NULL,                -- local | user@host:port | mock:<папка>
+    container  TEXT,                         -- NULL = определить автоматически
+    active     INTEGER NOT NULL DEFAULT 1,   -- 0 = скрыт для новых устройств
+    sort       INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    status_ok  INTEGER NOT NULL DEFAULT 1,   -- результат последней проверки
+    last_error TEXT,
+    last_check INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS keys (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     tg_id          INTEGER,
+    server_id      INTEGER,
     name           TEXT NOT NULL,
     public_key     TEXT NOT NULL UNIQUE,
     private_key    TEXT NOT NULL,
@@ -43,9 +58,10 @@ CREATE TABLE IF NOT EXISTS keys (
 );
 CREATE INDEX IF NOT EXISTS keys_tg_id ON keys(tg_id);
 CREATE TABLE IF NOT EXISTS traffic_daily (
-    key_id INTEGER NOT NULL,
-    tg_id  INTEGER,
-    day    TEXT NOT NULL,                -- YYYY-MM-DD в часовом поясе бота
+    key_id    INTEGER NOT NULL,
+    tg_id     INTEGER,
+    server_id INTEGER,
+    day       TEXT NOT NULL,               -- YYYY-MM-DD в часовом поясе бота
     rx     INTEGER NOT NULL DEFAULT 0,   -- от клиента к серверу (отдано клиентом)
     tx     INTEGER NOT NULL DEFAULT 0,   -- от сервера к клиенту (скачано клиентом)
     PRIMARY KEY (key_id, day)
@@ -102,8 +118,18 @@ _MIGRATIONS = {
         "last_handshake": "INTEGER NOT NULL DEFAULT 0",
         "last_rx": "INTEGER NOT NULL DEFAULT 0",
         "last_tx": "INTEGER NOT NULL DEFAULT 0",
+        "server_id": "INTEGER",
+    },
+    "traffic_daily": {
+        "server_id": "INTEGER",
     },
 }
+
+# Индексы по колонкам, которые могли появиться только после миграции.
+POST_MIGRATION = """
+CREATE INDEX IF NOT EXISTS keys_server ON keys(server_id);
+CREATE INDEX IF NOT EXISTS traffic_server_day ON traffic_daily(server_id, day);
+"""
 
 
 def now() -> int:
@@ -135,9 +161,30 @@ class User:
 
 
 @dataclass
+class Server:
+    id: int
+    name: str
+    flag: str
+    host: str
+    conn: str
+    container: str | None
+    active: int
+    sort: int
+    created_at: int
+    status_ok: int
+    last_error: str | None
+    last_check: int
+
+    @property
+    def title(self) -> str:
+        return f"{self.flag} {self.name}"
+
+
+@dataclass
 class Key:
     id: int
     tg_id: int | None
+    server_id: int | None
     name: str
     public_key: str
     private_key: str
@@ -204,6 +251,7 @@ class Database:
         await self.conn.execute("PRAGMA journal_mode=WAL")
         await self.conn.executescript(SCHEMA)
         await self._migrate()
+        await self.conn.executescript(POST_MIGRATION)
         async with self.c.execute("SELECT COUNT(*) FROM plans") as cur:
             if (await cur.fetchone())[0] == 0:
                 for i, (title, days, devices, price) in enumerate(DEFAULT_PLANS):
@@ -365,12 +413,60 @@ class Database:
         paid = await self._scalar("SELECT COUNT(*) FROM users WHERE referrer_id = ? AND ref_rewarded = 1", (tg_id,))
         return total or 0, paid or 0
 
+    # ---------- servers ----------
+
+    async def servers(self, only_active: bool = False) -> list[Server]:
+        where = "WHERE active = 1" if only_active else ""
+        return await self._all(Server, f"SELECT * FROM servers {where} ORDER BY sort, id")
+
+    async def get_server(self, server_id: int) -> Server | None:
+        return await self._one(Server, "SELECT * FROM servers WHERE id = ?", (server_id,))
+
+    async def add_server(self, name: str, flag: str, host: str, conn: str, container: str | None = None) -> Server:
+        sort = (await self._scalar("SELECT COALESCE(MAX(sort), 0) + 1 FROM servers")) or 0
+        cur = await self.c.execute(
+            "INSERT INTO servers (name, flag, host, conn, container, sort, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (name, flag, host, conn, container, sort, now()),
+        )
+        await self.c.commit()
+        server = await self.get_server(cur.lastrowid)
+        assert server
+        return server
+
+    async def update_server(self, server_id: int, **fields) -> None:
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        await self._exec(f"UPDATE servers SET {sets} WHERE id = ?", (*fields.values(), server_id))
+
+    async def delete_server(self, server_id: int) -> None:
+        await self._exec("DELETE FROM servers WHERE id = ?", (server_id,))
+
+    async def server_key_counts(self) -> dict[int, tuple[int, int, int]]:
+        """server_id -> (всего ключей, включённых, онлайн за 3 мин)."""
+        async with self.c.execute(
+            """SELECT server_id, COUNT(*), SUM(enabled), SUM(enabled = 1 AND last_handshake >= ?)
+               FROM keys GROUP BY server_id""",
+            (now() - 180,),
+        ) as cur:
+            return {r[0]: (r[1], r[2] or 0, r[3] or 0) for r in await cur.fetchall()}
+
+    async def assign_orphan_keys(self, server_id: int) -> int:
+        """Ключи из версии бота без мультисерверности привязываются к первому серверу."""
+        n = await self._exec("UPDATE keys SET server_id = ? WHERE server_id IS NULL", (server_id,))
+        await self._exec(
+            """UPDATE traffic_daily SET server_id = (SELECT server_id FROM keys WHERE keys.id = traffic_daily.key_id)
+               WHERE server_id IS NULL"""
+        )
+        return n
+
     # ---------- keys ----------
 
-    async def add_key(self, tg_id: int | None, name: str, public_key: str, private_key: str, ip: str) -> Key:
+    async def add_key(
+        self, tg_id: int | None, name: str, public_key: str, private_key: str, ip: str, server_id: int | None = None
+    ) -> Key:
         cur = await self.c.execute(
-            "INSERT INTO keys (tg_id, name, public_key, private_key, ip, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (tg_id, name, public_key, private_key, ip, now()),
+            """INSERT INTO keys (tg_id, server_id, name, public_key, private_key, ip, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (tg_id, server_id, name, public_key, private_key, ip, now()),
         )
         await self.c.commit()
         key = await self.get_key(cur.lastrowid)
@@ -386,12 +482,32 @@ class Database:
     async def all_keys(self) -> list[Key]:
         return await self._all(Key, "SELECT * FROM keys ORDER BY id")
 
-    async def enabled_keys(self) -> list[Key]:
-        return await self._all(Key, "SELECT * FROM keys WHERE enabled = 1")
+    async def enabled_keys(self, server_id: int | None = None) -> list[Key]:
+        if server_id is None:
+            return await self._all(Key, "SELECT * FROM keys WHERE enabled = 1")
+        return await self._all(Key, "SELECT * FROM keys WHERE enabled = 1 AND server_id = ?", (server_id,))
 
-    async def reserved_ips(self) -> set[str]:
-        async with self.c.execute("SELECT ip FROM keys") as cur:
+    async def server_keys(self, server_id: int) -> list[Key]:
+        return await self._all(Key, "SELECT * FROM keys WHERE server_id = ? ORDER BY id", (server_id,))
+
+    async def reserved_ips(self, server_id: int | None = None) -> set[str]:
+        """IP, занятые ключами из БД на данном сервере (в т.ч. отключёнными)."""
+        if server_id is None:
+            sql, args = "SELECT ip FROM keys", ()
+        else:
+            sql, args = "SELECT ip FROM keys WHERE server_id = ?", (server_id,)
+        async with self.c.execute(sql, args) as cur:
             return {r[0] for r in await cur.fetchall()}
+
+    async def other_ips(self, server_id: int, key_id: int) -> set[str]:
+        """IP остальных ключей этого сервера — их нельзя отдавать восстанавливаемому ключу."""
+        async with self.c.execute(
+            "SELECT ip FROM keys WHERE server_id = ? AND id != ? AND ip != ''", (server_id, key_id)
+        ) as cur:
+            return {r[0] for r in await cur.fetchall()}
+
+    async def key_by_public(self, public_key: str) -> Key | None:
+        return await self._one(Key, "SELECT * FROM keys WHERE public_key = ?", (public_key,))
 
     async def update_key(self, key_id: int, **fields) -> None:
         sets = ", ".join(f"{k} = ?" for k in fields)
@@ -405,9 +521,9 @@ class Database:
     async def add_traffic(self, key: Key, day: str, rx: int, tx: int, cur_rx: int, cur_tx: int, hs: int) -> None:
         if rx or tx:
             await self.c.execute(
-                """INSERT INTO traffic_daily (key_id, tg_id, day, rx, tx) VALUES (?, ?, ?, ?, ?)
+                """INSERT INTO traffic_daily (key_id, tg_id, server_id, day, rx, tx) VALUES (?, ?, ?, ?, ?, ?)
                    ON CONFLICT(key_id, day) DO UPDATE SET rx = rx + excluded.rx, tx = tx + excluded.tx""",
-                (key.id, key.tg_id, day, rx, tx),
+                (key.id, key.tg_id, key.server_id, day, rx, tx),
             )
         await self.c.execute(
             "UPDATE keys SET last_rx = ?, last_tx = ?, last_handshake = MAX(last_handshake, ?) WHERE id = ?",
@@ -417,8 +533,13 @@ class Database:
     async def commit(self) -> None:
         await self.c.commit()
 
-    async def traffic(self, *, tg_id: int | None = None, key_id: int | None = None, since: str = "") -> Traffic:
+    async def traffic(
+        self, *, tg_id: int | None = None, key_id: int | None = None, server_id: int | None = None, since: str = ""
+    ) -> Traffic:
         cond, args = ["day >= ?"], [since]
+        if server_id is not None:
+            cond.append("server_id = ?")
+            args.append(server_id)
         if tg_id is not None:
             cond.append("tg_id = ?")
             args.append(tg_id)

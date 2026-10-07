@@ -25,6 +25,29 @@ class Dev(CallbackData, prefix="d"):
     id: int
 
 
+class Loc(CallbackData, prefix="loc"):
+    """Выбор локации: new — для нового устройства, pick/move — перенос устройства `key`."""
+
+    action: str
+    key: int = 0
+    sid: int = 0
+
+
+class ASrv(CallbackData, prefix="as"):
+    """Админ: серверы."""
+
+    action: str  # list | view | add | edit | toggle | check | del | delok | resetkey | moveall | moveallok
+    id: int = 0
+    arg: int = 0
+
+
+class AMove(CallbackData, prefix="amv"):
+    """Админ: перенос устройства `key` на сервер `sid` (0 — выбрать)."""
+
+    key: int
+    sid: int = 0
+
+
 class Buy(CallbackData, prefix="buy"):
     action: str  # plan | paid
     plan_id: int

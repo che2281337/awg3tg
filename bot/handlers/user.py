@@ -24,6 +24,7 @@ from .keyboards import (
     APay,
     Buy,
     Dev,
+    Loc,
     Menu,
     back,
     ikb,
@@ -159,6 +160,7 @@ async def devices_view(db: Database, service: VpnService, user: User) -> tuple[s
     if not service.has_access(user):
         lines.append("⛔ Подписка не активна — устройства отключены.\n")
     online_border = now() - 180
+    flags = {s.id: s.flag for s in await db.servers()}
     for k in keys:
         if not k.enabled:
             state = "⏸"
@@ -166,10 +168,10 @@ async def devices_view(db: Database, service: VpnService, user: User) -> tuple[s
             state = "🟢"
         else:
             state = "⚪️"
-        lines.append(f"{state} {esc(k.name)}")
+        lines.append(f"{state} {flags.get(k.server_id, '❔')} {esc(k.name)}")
     if not keys:
         lines.append("Устройств пока нет.")
-    rows = [[(f"{k.name}", Dev(action="view", id=k.id).pack())] for k in keys]
+    rows = [[(f"{flags.get(k.server_id, '❔')} {k.name}", Dev(action="view", id=k.id).pack())] for k in keys]
     if service.has_access(user) and len(keys) < limit:
         rows.append([("➕ Добавить устройство", Menu(action="add").pack())])
     elif not service.has_access(user):
@@ -201,8 +203,22 @@ async def cb_add_device(call: CallbackQuery, state: FSMContext, db: Database, se
     if len(await db.user_keys(user.tg_id)) >= service.device_limit(user):
         await call.answer("Достигнут лимит устройств вашего тарифа", show_alert=True)
         return
+    servers = await service.available_servers()
+    if not servers:
+        await call.answer("Сейчас нет доступных серверов, попробуйте чуть позже", show_alert=True)
+        return
     await call.answer()
+    if len(servers) == 1:
+        await _ask_device_name(call, state, servers[0].id)
+        return
+    rows = [[(s.title, Loc(action="new", key=0, sid=s.id).pack())] for s in servers]
+    rows.append([back(Menu(action="devices"), "Отмена")])
+    await edit_or_send(call, "🌍 Выберите страну сервера:", ikb(rows))
+
+
+async def _ask_device_name(call: CallbackQuery, state: FSMContext, server_id: int) -> None:
     await state.set_state(UserStates.device_name)
+    await state.update_data(server_id=server_id)
     await edit_or_send(
         call,
         "Введите название устройства, например «Мой айфон» или «Ноутбук».\nОтмена — /cancel",
@@ -210,14 +226,25 @@ async def cb_add_device(call: CallbackQuery, state: FSMContext, db: Database, se
     )
 
 
-async def _create_and_send(bot: Bot, chat_id: int, db: Database, service: VpnService, user: User, name: str) -> None:
+@router.callback_query(Loc.filter(F.action == "new"))
+async def cb_new_location(call: CallbackQuery, callback_data: Loc, state: FSMContext, service: VpnService) -> None:
+    if callback_data.sid not in {s.id for s in await service.available_servers()}:
+        await call.answer("Эта локация сейчас недоступна, выберите другую", show_alert=True)
+        return
+    await call.answer()
+    await _ask_device_name(call, state, callback_data.sid)
+
+
+async def _create_and_send(
+    bot: Bot, chat_id: int, db: Database, service: VpnService, user: User, name: str, server_id: int
+) -> None:
     existing = {k.name for k in await db.user_keys(user.tg_id)}
     final, n = name, 2
     while final in existing:
         final, n = f"{name} {n}", n + 1
     wait = await bot.send_message(chat_id, "⏳ Создаю ключ…")
     try:
-        rk = await service.create_device(user, final)
+        rk = await service.create_device(user, final, server_id)
     except ServiceError as e:
         await wait.edit_text(f"❌ {e}")
         return
@@ -237,9 +264,17 @@ async def _create_and_send(bot: Bot, chat_id: int, db: Database, service: VpnSer
 
 @router.message(UserStates.device_name, F.text, ~F.text.in_(MENU_TEXTS), ~F.text.startswith("/"))
 async def st_device_name(message: Message, bot: Bot, state: FSMContext, db: Database, service: VpnService, user: User) -> None:
+    data = await state.get_data()
     await state.clear()
     name = message.text.strip()[:40] or "Устройство"
-    await _create_and_send(bot, message.chat.id, db, service, user, name)
+    server_id = data.get("server_id")
+    if server_id is None:
+        servers = await service.available_servers()
+        if not servers:
+            await message.answer("Сейчас нет доступных серверов, попробуйте чуть позже.")
+            return
+        server_id = servers[0].id
+    await _create_and_send(bot, message.chat.id, db, service, user, name, server_id)
 
 
 async def _own_key(call: CallbackQuery, db: Database, user: User, key_id: int):
@@ -251,7 +286,7 @@ async def _own_key(call: CallbackQuery, db: Database, user: User, key_id: int):
 
 
 @router.callback_query(Dev.filter(F.action == "view"))
-async def cb_device_view(call: CallbackQuery, callback_data: Dev, db: Database, user: User) -> None:
+async def cb_device_view(call: CallbackQuery, callback_data: Dev, db: Database, service: VpnService, user: User) -> None:
     key = await _own_key(call, db, user, callback_data.id)
     if key is None:
         return
@@ -259,9 +294,14 @@ async def cb_device_view(call: CallbackQuery, callback_data: Dev, db: Database, 
     t_today = await db.traffic(key_id=key.id, since=today())
     t_month = await db.traffic(key_id=key.id, since=month_start_day())
     t_all = await db.traffic(key_id=key.id)
+    server = await db.get_server(key.server_id) if key.server_id else None
+    location = server.title if server else "❔ сервер удалён — смените локацию"
+    if server and not server.status_ok:
+        location += " (🔴 временно недоступен)"
     status = "✅ активно" if key.enabled else "⏸ отключено (нет подписки или превышен лимит устройств)"
     text = (
         f"🔑 <b>{esc(key.name)}</b>\n\n"
+        f"Локация: {esc(location)}\n"
         f"Статус: {status}\n"
         f"Добавлено: {fmt_date(key.created_at)}\n"
         f"Последнее подключение: {fmt_dt(key.last_handshake)}\n\n"
@@ -270,14 +310,58 @@ async def cb_device_view(call: CallbackQuery, callback_data: Dev, db: Database, 
         f"За месяц: {human_bytes(t_month.tx)} / {human_bytes(t_month.rx)}\n"
         f"Всего: {human_bytes(t_all.tx)} / {human_bytes(t_all.rx)}"
     )
+    others = [s for s in await service.available_servers() if s.id != key.server_id]
     kb = ikb(
         [
             [("📤 Получить ключ", Dev(action="key", id=key.id).pack())],
+            [("🌍 Сменить локацию", Loc(action="pick", key=key.id, sid=0).pack())] if others else [],
             [("✏️ Переименовать", Dev(action="ren", id=key.id).pack()), ("🗑 Удалить", Dev(action="del", id=key.id).pack())],
             [back(Menu(action="devices"))],
         ]
     )
     await edit_or_send(call, text, kb)
+
+
+@router.callback_query(Loc.filter(F.action == "pick"))
+async def cb_pick_location(call: CallbackQuery, callback_data: Loc, db: Database, service: VpnService, user: User) -> None:
+    key = await _own_key(call, db, user, callback_data.key)
+    if key is None:
+        return
+    others = [s for s in await service.available_servers() if s.id != key.server_id]
+    if not others:
+        await call.answer("Других доступных локаций сейчас нет", show_alert=True)
+        return
+    await call.answer()
+    rows = [[(s.title, Loc(action="move", key=key.id, sid=s.id).pack())] for s in others]
+    rows.append([back(Dev(action="view", id=key.id))])
+    await edit_or_send(
+        call,
+        f"🌍 Куда перенести <b>{esc(key.name)}</b>?\n\n"
+        "После переноса придёт новый ключ — его нужно будет заново добавить в приложение, "
+        "а старый удалить.",
+        ikb(rows),
+    )
+
+
+@router.callback_query(Loc.filter(F.action == "move"))
+async def cb_move_device(
+    call: CallbackQuery, callback_data: Loc, bot: Bot, db: Database, service: VpnService, user: User
+) -> None:
+    key = await _own_key(call, db, user, callback_data.key)
+    if key is None:
+        return
+    await call.answer("Переношу…")
+    try:
+        rk = await service.move_device(key, callback_data.sid)
+    except ServiceError as e:
+        await call.message.answer(f"❌ {e}")
+        return
+    except AwgError:
+        log.exception("Ошибка переноса устройства")
+        await call.message.answer("❌ Сервер не отвечает, попробуйте позже или выберите другую локацию.")
+        return
+    await edit_or_send(call, f"✅ Устройство перенесено: {esc(rk.location)}. Добавьте новый ключ в приложение:")
+    await deliver_key(bot, call.from_user.id, rk)
 
 
 @router.callback_query(Dev.filter(F.action == "key"))
@@ -291,9 +375,14 @@ async def cb_device_key(call: CallbackQuery, callback_data: Dev, bot: Bot, db: D
         await call.answer()
     try:
         rk = await service.render(key)
+    except ServiceError as e:
+        await bot.send_message(call.from_user.id, f"❌ {e}")
+        return
     except AwgError:
         log.exception("Ошибка чтения конфига сервера")
-        await bot.send_message(call.from_user.id, "❌ Сервер недоступен, попробуйте позже.")
+        await bot.send_message(
+            call.from_user.id, "❌ Сервер недоступен, попробуйте позже или смените локацию в карточке устройства."
+        )
         return
     await deliver_key(bot, call.from_user.id, rk)
 
@@ -340,9 +429,9 @@ async def cb_device_delok(call: CallbackQuery, callback_data: Dev, db: Database,
         return
     try:
         await service.delete_device(key)
-    except AwgError:
+    except (AwgError, ServiceError):
         log.exception("Ошибка удаления устройства")
-        await call.answer("Не удалось удалить, попробуйте позже", show_alert=True)
+        await call.answer("Сервер не отвечает, удалить не получилось — попробуйте позже", show_alert=True)
         return
     await call.answer("Устройство удалено")
     text, kb = await devices_view(db, service, user)

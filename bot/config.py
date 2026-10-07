@@ -22,6 +22,10 @@ class Settings:
     # Публичный IP/домен сервера, который попадёт в Endpoint ключа.
     server_host: str = ""
     server_name: str = "AmneziaWG"
+    # Как назвать сервер, на котором запущен бот (если на нём есть AmneziaWG).
+    # Остальные серверы добавляются из админки.
+    server_location: str = "Основной"
+    server_flag: str = "🌐"
     dns1: str = "1.1.1.1"
     dns2: str = "1.0.0.1"
     client_mtu: str | None = None
@@ -47,6 +51,8 @@ class Settings:
 
     # Фоновые задачи
     stats_interval: int = 300
+    # Резервная копия базы админам в Telegram раз в N часов (0 — выключить)
+    backup_hours: int = 24
 
     # Демо-режим без VPN-сервера (см. bot/awg/mock.py)
     awg_mock: bool = False
@@ -63,6 +69,8 @@ class Settings:
             admin_ids=_ids(os.getenv("ADMIN_IDS", "")),
             server_host=os.getenv("SERVER_HOST", "").strip(),
             server_name=os.getenv("SERVER_NAME", "AmneziaWG").strip() or "AmneziaWG",
+            server_location=os.getenv("SERVER_LOCATION", "Основной").strip() or "Основной",
+            server_flag=os.getenv("SERVER_FLAG", "🌐").strip() or "🌐",
             dns1=os.getenv("DNS1", "1.1.1.1").strip(),
             dns2=os.getenv("DNS2", "1.0.0.1").strip(),
             client_mtu=os.getenv("CLIENT_MTU", "").strip() or None,
@@ -81,5 +89,6 @@ class Settings:
             ref_bonus_days=_int("REF_BONUS_DAYS", 7),
             default_devices=_int("DEFAULT_DEVICES", 1),
             stats_interval=max(60, _int("STATS_INTERVAL", 300)),
+            backup_hours=max(0, _int("BACKUP_HOURS", 24)),
             awg_mock=os.getenv("AWG_MOCK", "").strip().lower() in ("1", "true", "yes", "on"),
         )

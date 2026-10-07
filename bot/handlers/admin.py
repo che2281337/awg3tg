@@ -28,7 +28,7 @@ from ..utils import (
     today,
 )
 from .common import deliver_key, edit_or_send, send_long
-from .keyboards import AK, AU, BTN_ADMIN, MENU_TEXTS, Adm, APay, APlan, Bcast, UList, back, ikb, main_menu
+from .keyboards import AK, AU, BTN_ADMIN, MENU_TEXTS, Adm, AMove, APay, APlan, ASrv, Bcast, UList, back, ikb, main_menu
 
 log = logging.getLogger(__name__)
 router = Router(name="admin")
@@ -57,6 +57,7 @@ class AdminStates(StatesGroup):
     message = State()
     broadcast = State()
     plan = State()
+    server = State()
 
 
 def panel_kb(pending: int):
@@ -64,7 +65,7 @@ def panel_kb(pending: int):
         [
             [("👥 Пользователи", UList(flt="all").pack()), (f"💳 Платежи ({pending})", Adm(action="payments").pack())],
             [("📊 Статистика", Adm(action="stats").pack()), ("📦 Тарифы", Adm(action="plans").pack())],
-            [("📢 Рассылка", Adm(action="bcast").pack()), ("🖥 Сервер", Adm(action="server").pack())],
+            [("📢 Рассылка", Adm(action="bcast").pack()), ("🖥 Серверы", ASrv(action="list").pack())],
             [("🧹 Неактивные", Adm(action="inactive", arg=30).pack()), ("🔎 Поиск", Adm(action="find").pack())],
         ]
     )
@@ -73,7 +74,8 @@ def panel_kb(pending: int):
 PANEL_TEXT = (
     "🛠 <b>Админ-панель</b>\n\n"
     "Команды: /user <code>ID|@ник</code>, /extend <code>ID дни</code>, /ban <code>ID</code>, "
-    "/unban <code>ID</code>, /msg <code>ID текст</code>, /inactive <code>дни</code>"
+    "/unban <code>ID</code>, /msg <code>ID текст</code>, /inactive <code>дни</code>, "
+    "/backup — резервная копия базы"
 )
 
 
@@ -380,8 +382,8 @@ async def cb_del_user_ok(call: CallbackQuery, callback_data: AU, service: VpnSer
         return
     try:
         await service.delete_user(callback_data.uid)
-    except AwgError as e:
-        await call.answer(f"Ошибка: {e}", show_alert=True)
+    except (AwgError, ServiceError) as e:
+        await call.answer(f"Сервер с устройствами пользователя не отвечает: {e}"[:190], show_alert=True)
         return
     await call.answer("Аккаунт удалён")
     await edit_or_send(call, f"🗑 Аккаунт {callback_data.uid} удалён.", ikb([[back(UList(flt="all"), "⬅️ К списку")]]))
@@ -447,16 +449,18 @@ async def cb_user_keys(call: CallbackQuery, callback_data: AU, db: Database, ser
     await call.answer()
     uid = callback_data.uid
     keys = await db.user_keys(uid)
+    flags = {s.id: s.flag for s in await db.servers()}
     lines = [f"🔑 <b>Устройства</b> {uid}\n"]
     for k in keys:
         t = await db.traffic(key_id=k.id, since=month_start_day())
         state = "⏸" if not k.enabled else ("🟢" if k.last_handshake >= now() - 180 else "⚪️")
         lines.append(
-            f"{state} #{k.id} {esc(k.name)} · {k.ip} · был {fmt_dt(k.last_handshake)} · за месяц {human_bytes(t.total)}"
+            f"{state} {flags.get(k.server_id, '❔')} #{k.id} {esc(k.name)} · {k.ip} · был {fmt_dt(k.last_handshake)}"
+            f" · за месяц {human_bytes(t.total)}"
         )
     if not keys:
         lines.append("Устройств нет.")
-    rows = [[(f"#{k.id} {k.name}", AK(action="view", id=k.id).pack())] for k in keys]
+    rows = [[(f"{flags.get(k.server_id, '❔')} #{k.id} {k.name}", AK(action="view", id=k.id).pack())] for k in keys]
     rows.append([("➕ Создать устройство", AU(action="addkey", uid=uid).pack())])
     rows.append([back(AU(action="card", uid=uid))])
     await edit_or_send(call, "\n".join(lines), ikb(rows))
@@ -468,9 +472,19 @@ async def cb_user_addkey(call: CallbackQuery, callback_data: AU, bot: Bot, db: D
     if u is None:
         await call.answer("Не найден", show_alert=True)
         return
+    if not callback_data.arg:  # сначала выбираем сервер
+        servers = [s for s in await db.servers() if s.status_ok]
+        if not servers:
+            await call.answer("Нет работающих серверов", show_alert=True)
+            return
+        await call.answer()
+        rows = [[(s.title, AU(action="addkey", uid=u.tg_id, arg=s.id).pack())] for s in servers]
+        rows.append([back(AU(action="keys", uid=u.tg_id))])
+        await edit_or_send(call, "На каком сервере создать устройство?", ikb(rows))
+        return
     n = len(await db.user_keys(u.tg_id)) + 1
     try:
-        rk = await service.create_device(u, f"Устройство {n}")
+        rk = await service.create_device(u, f"Устройство {n}", callback_data.arg, force=True)
     except (ServiceError, AwgError) as e:
         await call.answer(str(e)[:190], show_alert=True)
         return
@@ -489,9 +503,11 @@ async def cb_key_view(call: CallbackQuery, callback_data: AK, db: Database) -> N
     await call.answer()
     t_month = await db.traffic(key_id=key.id, since=month_start_day())
     t_all = await db.traffic(key_id=key.id)
+    server = await db.get_server(key.server_id) if key.server_id else None
     text = (
         f"🔑 <b>#{key.id} {esc(key.name)}</b>\n"
-        f"Владелец: <code>{key.tg_id}</code>\nIP: {key.ip}\n"
+        f"Владелец: <code>{key.tg_id}</code>\n"
+        f"Сервер: {esc(server.title) if server else '❔ удалён'}\nIP: {key.ip}\n"
         f"Статус: {'✅ активен' if key.enabled else '⏸ отключён'}\n"
         f"Создан: {fmt_dt(key.created_at)}\nПоследнее подключение: {fmt_dt(key.last_handshake)}\n"
         f"Трафик за месяц: ↓{human_bytes(t_month.tx)} ↑{human_bytes(t_month.rx)}\n"
@@ -500,10 +516,43 @@ async def cb_key_view(call: CallbackQuery, callback_data: AK, db: Database) -> N
     )
     rows = [
         [("📤 Получить ключ", AK(action="key", id=key.id).pack()), ("🗑 Удалить", AK(action="del", id=key.id).pack())],
+        [("🌍 Перенести на другой сервер", AMove(key=key.id).pack())],
     ]
     if key.tg_id:
         rows.append([back(AU(action="keys", uid=key.tg_id))])
     await edit_or_send(call, text, ikb(rows))
+
+
+@router.callback_query(AMove.filter())
+async def cb_key_move(call: CallbackQuery, callback_data: AMove, bot: Bot, db: Database, service: VpnService) -> None:
+    key = await db.get_key(callback_data.key)
+    if key is None:
+        await call.answer("Ключ не найден", show_alert=True)
+        return
+    if not callback_data.sid:
+        targets = [s for s in await db.servers() if s.id != key.server_id and s.status_ok]
+        if not targets:
+            await call.answer("Нет других работающих серверов", show_alert=True)
+            return
+        await call.answer()
+        rows = [[(s.title, AMove(key=key.id, sid=s.id).pack())] for s in targets]
+        rows.append([back(AK(action="view", id=key.id))])
+        await edit_or_send(call, f"Куда перенести #{key.id} {esc(key.name)}?", ikb(rows))
+        return
+    try:
+        rk = await service.move_device(key, callback_data.sid, force=True)
+    except (ServiceError, AwgError) as e:
+        await call.answer(str(e)[:190], show_alert=True)
+        return
+    await call.answer("Перенесено")
+    await edit_or_send(call, f"✅ #{key.id} перенесён: {esc(rk.location)}", ikb([[back(AK(action="view", id=key.id))]]))
+    if key.tg_id:
+        await _notify(
+            bot,
+            key.tg_id,
+            f"🌍 Ваше устройство «{esc(key.name)}» перенесено на сервер {esc(rk.location)}.\n"
+            "Получите новый ключ в «🔑 Мои устройства» и добавьте его в приложение.",
+        )
 
 
 @router.callback_query(AK.filter(F.action == "key"))
@@ -534,8 +583,8 @@ async def cb_key_delok(call: CallbackQuery, callback_data: AK, bot: Bot, db: Dat
         return
     try:
         await service.delete_device(key)
-    except AwgError as e:
-        await call.answer(f"Ошибка: {e}", show_alert=True)
+    except (AwgError, ServiceError) as e:
+        await call.answer(f"Ошибка: {e}"[:190], show_alert=True)
         return
     await call.answer("Ключ удалён")
     if key.tg_id:
@@ -656,8 +705,15 @@ async def cb_stats(call: CallbackQuery, db: Database, service: VpnService) -> No
         f"Месяц: {human_bytes(t_month.tx)} / {human_bytes(t_month.rx)}",
         f"Всего: {human_bytes(t_all.tx)} / {human_bytes(t_all.rx)}",
         "",
-        "🏆 <b>Топ за месяц:</b>",
+        "🖥 <b>По серверам</b> (устройств · онлайн · трафик за месяц):",
     ]
+    counts = await db.server_key_counts()
+    for srv in await db.servers():
+        total, _, online = counts.get(srv.id, (0, 0, 0))
+        t = await db.traffic(server_id=srv.id, since=month_start_day())
+        mark = "🟢" if srv.status_ok else "🔴"
+        lines.append(f"{mark} {esc(srv.title)}: {total} · {online} · {human_bytes(t.total)}")
+    lines += ["", "🏆 <b>Топ за месяц:</b>"]
     top = await db.top_traffic(month_start_day())
     rows = []
     for i, (uid, t) in enumerate(top, 1):
@@ -831,34 +887,300 @@ async def cb_bcast_send(call: CallbackQuery, callback_data: Bcast, bot: Bot, sta
     await bot.send_message(call.from_user.id, f"📢 Рассылка завершена: доставлено {ok} из {len(ids)}.")
 
 
-# ---------- сервер ----------
+# ---------- серверы ----------
 
 
-@router.callback_query(Adm.filter(F.action == "server"))
-async def cb_server(call: CallbackQuery, db: Database, service: VpnService) -> None:
+def _conn_label(conn: str) -> str:
+    if conn == "local":
+        return "этот же сервер (local)"
+    if conn.startswith("mock:"):
+        return "демо-эмуляция"
+    return f"SSH {conn}"
+
+
+@router.callback_query(ASrv.filter(F.action == "list"))
+async def cb_servers(call: CallbackQuery, state: FSMContext, db: Database) -> None:
+    await state.clear()
     await call.answer()
+    servers = await db.servers()
+    counts = await db.server_key_counts()
+    lines = ["🖥 <b>Серверы</b>\n", "🟢 работает · 🔴 недоступен · 🙈 скрыт для новых устройств\n"]
+    rows = []
+    for s in servers:
+        total, _, online = counts.get(s.id, (0, 0, 0))
+        mark = ("🟢" if s.status_ok else "🔴") + ("" if s.active else "🙈")
+        label = f"{mark} {s.title} · {total} устр. · онлайн {online}"
+        lines.append(esc(label))
+        rows.append([(label, ASrv(action="view", id=s.id).pack())])
+    if not servers:
+        lines.append("Серверов пока нет — добавьте первый.")
+    rows.append([("➕ Добавить сервер", ASrv(action="add").pack())])
+    rows.append([("🔄 Проверить все", ASrv(action="checkall").pack()), back(Adm(action="panel"))])
+    await edit_or_send(call, "\n".join(lines), ikb(rows))
+
+
+@router.callback_query(ASrv.filter(F.action == "checkall"))
+async def cb_servers_check(call: CallbackQuery, state: FSMContext, db: Database, service: VpnService) -> None:
+    await call.answer("Проверяю…")
+    await service.check_servers()
+    await cb_servers(call, state, db)
+
+
+async def server_card(db: Database, service: VpnService, row) -> tuple[str, object]:
+    counts = await db.server_key_counts()
+    total, enabled, online_db = counts.get(row.id, (0, 0, 0))
+    t_today = await db.traffic(server_id=row.id, since=today())
+    t_month = await db.traffic(server_id=row.id, since=month_start_day())
+    lines = [
+        f"🖥 <b>{esc(row.title)}</b>",
+        f"Статус: {'🟢 работает' if row.status_ok else '🔴 недоступен'}"
+        + ("" if row.active else ", 🙈 скрыт для новых устройств"),
+        f"Адрес для клиентов: <code>{esc(row.host)}</code>",
+        f"Подключение: {esc(_conn_label(row.conn))}",
+        f"Проверен: {fmt_dt(row.last_check)}",
+    ]
+    if row.last_error and not row.status_ok:
+        lines.append(f"Ошибка: <code>{esc(row.last_error[:400])}</code>")
+    lines.append(f"\nУстройств в боте: {total} (активных {enabled})")
     try:
-        cfg = await service.server.load_config()
-        info = await service.server.server_info(cfg)
-        stats = await service.server.stats()
-    except AwgError as e:
-        await edit_or_send(call, f"❌ Сервер недоступен: <code>{esc(e)}</code>", ikb([[back(Adm(action="panel"))]]))
+        info, peers, online = await service.server_details(row)
+        version = protocol_version(info.awg_params) or "1.0 / WireGuard"
+        lines += [
+            f"AmneziaWG: <b>{version}</b>, порт {info.port}, контейнер <code>{esc(info.container)}</code>",
+            f"Пиров на сервере: {peers}, онлайн сейчас: {online}",
+        ]
+    except (AwgError, ServiceError) as e:
+        lines.append(f"Детали недоступны: <code>{esc(str(e)[:300])}</code>")
+    lines += [
+        f"\n📶 Трафик сегодня: {human_bytes(t_today.total)}, за месяц: {human_bytes(t_month.total)}",
+    ]
+    a = lambda action, arg=0: ASrv(action=action, id=row.id, arg=arg).pack()  # noqa: E731
+    rows = [
+        [("🔄 Проверить", a("check")), ("✏️ Изменить", a("edit"))],
+        [("🙈 Скрыть для новых" if row.active else "👁 Показывать клиентам", a("toggle"))],
+        [("🚚 Перенести всех клиентов", a("moveall"))] if total else [],
+        [("🔑 Сбросить SSH-ключ сервера", a("resetkey"))] if not row.conn.startswith(("local", "mock:")) else [],
+        [("🗑 Удалить сервер", a("del"))],
+        [back(ASrv(action="list"))],
+    ]
+    return "\n".join(lines), ikb(rows)
+
+
+async def _server_or_alert(call: CallbackQuery, db: Database, server_id: int):
+    row = await db.get_server(server_id)
+    if row is None:
+        await call.answer("Сервер не найден", show_alert=True)
+    return row
+
+
+@router.callback_query(ASrv.filter(F.action == "view"))
+async def cb_server_view(call: CallbackQuery, callback_data: ASrv, db: Database, service: VpnService) -> None:
+    row = await _server_or_alert(call, db, callback_data.id)
+    if row is None:
         return
-    version = protocol_version(info.awg_params) or "1.0 / WireGuard"
-    online = sum(1 for s in stats.values() if s.latest_handshake and now() - s.latest_handshake < 180)
-    params = "\n".join(f"  {k} = {esc(v if len(v) < 60 else v[:57] + '…')}" for k, v in info.awg_params.items())
-    known = {k.public_key for k in await db.all_keys()}
-    foreign = sum(1 for p in cfg.peers if p.get("PublicKey") not in known)
-    text = (
-        f"🖥 <b>Сервер</b>\n"
-        f"Контейнер: <code>{esc(info.container)}</code>\n"
-        f"Адрес: <code>{esc(service.host)}:{info.port}</code>\n"
-        f"Протокол AmneziaWG: <b>{version}</b>\n"
-        f"Подсеть: {info.subnet_address}/{info.subnet_cidr}\n"
-        f"Пиров на сервере: {len(cfg.peers)} (из них созданы не ботом: {foreign}), онлайн: {online}\n\n"
-        f"<b>Параметры обфускации:</b>\n<pre>{params or '—'}</pre>"
+    await call.answer()
+    text, kb = await server_card(db, service, row)
+    await edit_or_send(call, text, kb)
+
+
+@router.callback_query(ASrv.filter(F.action == "check"))
+async def cb_server_check(call: CallbackQuery, callback_data: ASrv, db: Database, service: VpnService) -> None:
+    row = await _server_or_alert(call, db, callback_data.id)
+    if row is None:
+        return
+    res = await service.check_server(row)
+    await call.answer("✅ Сервер отвечает" if res.ok else f"🔴 {res.error[:180]}", show_alert=not res.ok)
+    row = await db.get_server(row.id)
+    text, kb = await server_card(db, service, row)
+    await edit_or_send(call, text, kb)
+
+
+@router.callback_query(ASrv.filter(F.action == "toggle"))
+async def cb_server_toggle(call: CallbackQuery, callback_data: ASrv, db: Database, service: VpnService) -> None:
+    row = await _server_or_alert(call, db, callback_data.id)
+    if row is None:
+        return
+    await db.update_server(row.id, active=0 if row.active else 1)
+    await call.answer("Сервер скрыт для новых устройств" if row.active else "Сервер снова доступен клиентам")
+    text, kb = await server_card(db, service, await db.get_server(row.id))
+    await edit_or_send(call, text, kb)
+
+
+@router.callback_query(ASrv.filter(F.action == "resetkey"))
+async def cb_server_resetkey(call: CallbackQuery, callback_data: ASrv, db: Database, service: VpnService) -> None:
+    from ..awg.runner import parse_ssh_target
+
+    row = await _server_or_alert(call, db, callback_data.id)
+    if row is None:
+        return
+    try:
+        _, host, port = parse_ssh_target(row.conn)
+    except ValueError:
+        await call.answer("Это не SSH-сервер", show_alert=True)
+        return
+    service.pool.ssh.forget(host, port)
+    await service.pool.drop(row.id)
+    await call.answer("Ключ сервера забыт — при следующем подключении будет запомнен новый", show_alert=True)
+
+
+def _ssh_help(pubkey: str) -> str:
+    return (
+        "➕ <b>Добавление сервера</b>\n\n"
+        "1. Установите на сервер AmneziaWG через приложение AmneziaVPN (как обычно).\n"
+        "2. Разрешите боту вход по SSH — выполните на этом сервере одну команду:\n"
+        f"<pre>mkdir -p ~/.ssh &amp;&amp; echo '{esc(pubkey)}' &gt;&gt; ~/.ssh/authorized_keys</pre>\n"
+        "3. Отправьте сюда строку:\n"
+        "<code>Название | флаг | IP сервера</code>\n"
+        "например: <code>Нидерланды | 🇳🇱 | 5.6.7.8</code>\n\n"
+        "Если SSH не на 22 порту или пользователь не root, добавьте четвёртым полем подключение:\n"
+        "<code>Нидерланды | 🇳🇱 | 5.6.7.8 | admin@5.6.7.8:2222</code>\n"
+        "(у не-root пользователя должен быть sudo без пароля для docker).\n\n"
+        "Для сервера, на котором запущен сам бот, укажите <code>local</code>:\n"
+        "<code>Германия | 🇩🇪 | 1.2.3.4 | local</code>\n\n"
+        "Отмена — /cancel"
     )
-    await edit_or_send(call, text, ikb([[back(Adm(action="panel"))]]))
+
+
+@router.callback_query(ASrv.filter(F.action.in_({"add", "edit"})))
+async def cb_server_add(call: CallbackQuery, callback_data: ASrv, state: FSMContext, db: Database, service: VpnService) -> None:
+    await call.answer()
+    await state.set_state(AdminStates.server)
+    await state.update_data(server_id=callback_data.id if callback_data.action == "edit" else 0)
+    try:
+        pubkey = await asyncio.to_thread(service.pool.ssh.ensure_key)
+    except Exception as e:  # нет asyncssh и т.п.
+        pubkey = f"(не удалось создать SSH-ключ: {e})"
+    text = _ssh_help(pubkey)
+    if callback_data.action == "edit":
+        row = await db.get_server(callback_data.id)
+        if row:
+            text = (
+                f"✏️ Текущие данные:\n<code>{esc(row.name)} | {esc(row.flag)} | {esc(row.host)} | {esc(row.conn)}</code>\n\n"
+                + text.replace("➕ <b>Добавление сервера</b>\n\n", "")
+            )
+    await call.message.answer(text)
+
+
+def _parse_server_line(text: str) -> tuple[str, str, str, str]:
+    parts = [p.strip() for p in text.split("|")]
+    if len(parts) not in (3, 4) or not all(parts[:3]):
+        raise ValueError
+    name, flag, host = parts[0][:40], parts[1][:8], parts[2][:255]
+    conn = parts[3] if len(parts) == 4 and parts[3] else f"root@{host}"
+    return name, flag, host, conn
+
+
+@router.message(AdminStates.server, _INPUT)
+async def st_server(message: Message, state: FSMContext, db: Database, service: VpnService) -> None:
+    try:
+        name, flag, host, conn = _parse_server_line(message.text)
+    except ValueError:
+        await message.answer("Не получилось разобрать. Формат: <code>Название | флаг | IP</code> (или /cancel)")
+        return
+    data = await state.get_data()
+    wait = await message.answer("⏳ Подключаюсь к серверу…")
+    try:
+        if data.get("server_id"):
+            row = await db.get_server(data["server_id"])
+            if row is None:
+                await state.clear()
+                await wait.edit_text("Сервер не найден.")
+                return
+            from ..service import validate_conn
+
+            await service.update_server(row, name=name, flag=flag, host=host, conn=validate_conn(conn))
+            row = await db.get_server(row.id)
+            res = await service.check_server(row)
+            result = "✅ Сохранено, сервер отвечает." if res.ok else f"⚠️ Сохранено, но сервер не отвечает:\n<code>{esc(res.error)}</code>"
+        else:
+            row = await service.add_server(name, flag, host, conn)
+            result = f"✅ Сервер {esc(row.title)} добавлен и доступен клиентам."
+    except (ServiceError, ValueError) as e:
+        await wait.edit_text(f"❌ {esc(e)}\n\nИсправьте и отправьте строку ещё раз (или /cancel).")
+        return
+    await state.clear()
+    await wait.edit_text(result, reply_markup=ikb([[("🖥 Серверы", ASrv(action="list").pack())]]))
+
+
+@router.callback_query(ASrv.filter(F.action == "del"))
+async def cb_server_del(call: CallbackQuery, callback_data: ASrv, db: Database) -> None:
+    row = await _server_or_alert(call, db, callback_data.id)
+    if row is None:
+        return
+    if await db.server_keys(row.id):
+        await call.answer("На сервере есть устройства — сначала перенесите клиентов", show_alert=True)
+        return
+    await call.answer()
+    await edit_or_send(
+        call,
+        f"Удалить сервер {esc(row.title)} из бота? На самом сервере ничего не изменится.",
+        ikb([[("🗑 Да, удалить", ASrv(action="delok", id=row.id).pack()), back(ASrv(action="view", id=row.id), "Отмена")]]),
+    )
+
+
+@router.callback_query(ASrv.filter(F.action == "delok"))
+async def cb_server_delok(call: CallbackQuery, callback_data: ASrv, state: FSMContext, db: Database, service: VpnService) -> None:
+    row = await _server_or_alert(call, db, callback_data.id)
+    if row is None:
+        return
+    try:
+        await service.delete_server(row)
+    except ServiceError as e:
+        await call.answer(str(e), show_alert=True)
+        return
+    await cb_servers(call, state, db)
+
+
+@router.callback_query(ASrv.filter(F.action == "moveall"))
+async def cb_server_moveall(call: CallbackQuery, callback_data: ASrv, db: Database) -> None:
+    row = await _server_or_alert(call, db, callback_data.id)
+    if row is None:
+        return
+    targets = [s for s in await db.servers() if s.id != row.id and s.status_ok]
+    if not targets:
+        await call.answer("Нет других работающих серверов", show_alert=True)
+        return
+    await call.answer()
+    n = len(await db.server_keys(row.id))
+    rows = [[(s.title, ASrv(action="moveallok", id=row.id, arg=s.id).pack())] for s in targets]
+    rows.append([back(ASrv(action="view", id=row.id))])
+    await edit_or_send(
+        call,
+        f"🚚 Перенести {devices_word(n)} с {esc(row.title)} на другой сервер?\n\n"
+        "Клиентам придёт уведомление — им нужно будет заново получить ключ в «🔑 Мои устройства».",
+        ikb(rows),
+    )
+
+
+@router.callback_query(ASrv.filter(F.action == "moveallok"))
+async def cb_server_moveallok(call: CallbackQuery, callback_data: ASrv, bot: Bot, db: Database, service: VpnService) -> None:
+    src = await _server_or_alert(call, db, callback_data.id)
+    dst = await db.get_server(callback_data.arg)
+    if src is None or dst is None:
+        return
+    await call.answer("Переношу…")
+    await edit_or_send(call, f"🚚 Переношу устройства {esc(src.title)} → {esc(dst.title)}…")
+    ok = failed = 0
+    for key in await db.server_keys(src.id):
+        try:
+            await service.move_device(key, dst.id, force=True)
+            ok += 1
+        except (AwgError, ServiceError) as e:
+            failed += 1
+            log.warning("Не удалось перенести ключ #%s: %s", key.id, e)
+            continue
+        if key.tg_id:
+            await _notify(
+                bot,
+                key.tg_id,
+                f"🌍 Ваше устройство «{esc(key.name)}» перенесено на сервер {esc(dst.title)}.\n"
+                "Получите новый ключ в «🔑 Мои устройства» и добавьте его в приложение.",
+            )
+    await bot.send_message(
+        call.from_user.id,
+        f"🚚 Готово: перенесено {ok}" + (f", не удалось {failed} (см. логи)" if failed else "") + ".",
+        reply_markup=ikb([[("🖥 Серверы", ASrv(action="list").pack())]]),
+    )
 
 
 # ---------- неактивные аккаунты ----------
@@ -913,7 +1235,7 @@ async def cb_inactive_delok(call: CallbackQuery, callback_data: Adm, bot: Bot, d
         try:
             await service.delete_user(u.tg_id)
             deleted += 1
-        except AwgError:
+        except (AwgError, ServiceError):
             log.exception("Не удалось удалить %s", u.tg_id)
     await edit_or_send(call, f"🗑 Удалено аккаунтов: {deleted}.", ikb([[back(Adm(action="panel"))]]))
 
@@ -931,6 +1253,14 @@ async def cmd_keys(message: Message, bot: Bot, db: Database) -> None:
             f"{'✅' if k.enabled else '⏸'} #{k.id} {esc(k.name)} (<code>{k.tg_id}</code>) {k.ip} — {fmt_dt(k.last_handshake)}"
         )
     await send_long(bot, message.chat.id, "\n".join(lines))
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message, bot: Bot, service: VpnService) -> None:
+    from ..scheduler import send_backup
+
+    await message.answer("💾 Готовлю резервную копию…")
+    await send_backup(bot, service, force=True)
 
 
 @router.message(Command("menu"))

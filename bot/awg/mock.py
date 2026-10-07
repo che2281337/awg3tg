@@ -61,7 +61,13 @@ class MockAwgServer(AwgServer):
     def _local(self, path: str) -> str:
         return os.path.join(self.root, path.lstrip("/"))
 
+    def _check_up(self) -> None:
+        # Чтобы «уронить» демо-сервер, создайте в его папке файл DOWN.
+        if os.path.exists(os.path.join(self.root, "DOWN")):
+            raise AwgError("демо-сервер выключен (файл DOWN)")
+
     async def detect(self) -> None:
+        self._check_up()
         conf_path, iface, binary = KNOWN_CONTAINERS["amnezia-awg2"]
         self._config_path, self._interface, self._binary = conf_path, iface, binary
         conf = self._local(conf_path)
@@ -72,9 +78,10 @@ class MockAwgServer(AwgServer):
                 f.write(_sample_server_conf())
             with open(self._local(f"{AWG_DIR}/wireguard_psk.key"), "w") as f:
                 f.write(psk + "\n")
-        log.warning("ДЕМО-РЕЖИМ: VPN-сервер эмулируется в %s, ключи не будут подключаться", self.root)
+        log.info("ДЕМО-РЕЖИМ: VPN-сервер эмулируется в %s, ключи не будут подключаться", self.root)
 
     async def read_file(self, path: str) -> str:
+        self._check_up()
         try:
             with open(self._local(path), encoding="utf-8") as f:
                 return f.read()
@@ -82,6 +89,7 @@ class MockAwgServer(AwgServer):
             raise AwgError(f"{path}: нет такого файла")
 
     async def write_file(self, path: str, content: str) -> None:
+        self._check_up()
         local = self._local(path)
         os.makedirs(os.path.dirname(local), exist_ok=True)
         with open(local + ".tmp", "w", encoding="utf-8") as f:

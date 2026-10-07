@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -10,8 +9,6 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, ErrorEvent
 
-from .awg.mock import MockAwgServer
-from .awg.server import AwgServer
 from .config import Settings
 from .db import Database
 from .handlers import admin, user
@@ -60,18 +57,9 @@ async def main() -> None:
     db = Database(settings.db_path)
     await db.connect()
 
-    if settings.awg_mock:
-        server: AwgServer = MockAwgServer(os.path.join(os.path.dirname(settings.db_path) or ".", "mock-server"))
-        settings.server_host = settings.server_host or "127.0.0.1"
-    else:
-        server = AwgServer(
-            container=settings.awg_container,
-            config_path=settings.awg_config_path,
-            interface=settings.awg_interface,
-            binary=settings.awg_bin,
-            docker=settings.docker_bin,
-        )
-    service = VpnService(settings, db, server)
+    # Серверы хранятся в базе: при первом запуске бот добавит сервер, на котором запущен
+    # (или демо-серверы при AWG_MOCK=1), остальные добавляются из админки.
+    service = VpnService(settings, db)
     await service.start()
 
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -93,6 +81,7 @@ async def main() -> None:
     finally:
         for t in tasks:
             t.cancel()
+        await service.close()
         await db.close()
         await bot.session.close()
 

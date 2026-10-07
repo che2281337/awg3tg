@@ -18,6 +18,7 @@ from datetime import datetime
 
 from . import conf as wgconf
 from .keys import generate_keypair, public_from_private
+from .runner import LocalRunner, Runner, RunnerError
 
 log = logging.getLogger(__name__)
 
@@ -76,34 +77,33 @@ class AwgServer:
         interface: str | None = None,
         binary: str | None = None,
         docker: str = "docker",
+        runner: Runner | None = None,
     ) -> None:
         self.container = container
         self._config_path = config_path
         self._interface = interface
         self._binary = binary
-        self.docker = docker
+        self.runner = runner or LocalRunner(docker)
         self._lock = asyncio.Lock()
 
     # ---------- низкоуровневое ----------
 
     async def _run(self, *args: str, stdin: bytes | None = None, check: bool = True) -> str:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out, err = await proc.communicate(stdin)
-        if check and proc.returncode != 0:
-            raise AwgError(f"{' '.join(args[:4])}...: {err.decode(errors='replace').strip() or proc.returncode}")
-        return out.decode(errors="replace")
+        try:
+            code, out, err = await self.runner.run(list(args), stdin)
+        except RunnerError as e:
+            raise AwgError(str(e)) from e
+        if check and code != 0:
+            raise AwgError(f"{' '.join(args[:4])}...: {err.strip() or code}")
+        return out
 
     async def _exec(self, script: str, stdin: bytes | None = None, check: bool = True) -> str:
         assert self.container, "container not detected"
         flags = ["-i"] if stdin is not None else []
-        return await self._run(
-            self.docker, "exec", *flags, self.container, "bash", "-c", script, stdin=stdin, check=check
-        )
+        return await self._run("docker", "exec", *flags, self.container, "bash", "-c", script, stdin=stdin, check=check)
+
+    async def close(self) -> None:
+        await self.runner.close()
 
     async def read_file(self, path: str) -> str:
         return await self._exec(f"cat {shlex.quote(path)}")
@@ -120,7 +120,7 @@ class AwgServer:
     async def detect(self) -> None:
         """Определяет контейнер AWG, если он не задан явно."""
         if not self.container:
-            names = (await self._run(self.docker, "ps", "--format", "{{.Names}}")).split()
+            names = (await self._run("docker", "ps", "--format", "{{.Names}}")).split()
             for candidate in KNOWN_CONTAINERS:
                 if candidate in names:
                     self.container = candidate
@@ -135,7 +135,8 @@ class AwgServer:
         self._interface = self._interface or defaults[1]
         self._binary = self._binary or defaults[2]
         log.info(
-            "AWG: container=%s config=%s iface=%s bin=%s",
+            "AWG [%s]: container=%s config=%s iface=%s bin=%s",
+            self.runner.description,
             self.container,
             self._config_path,
             self._interface,

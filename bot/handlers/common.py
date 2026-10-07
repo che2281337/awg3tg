@@ -118,7 +118,8 @@ async def send_long(bot: Bot, chat_id: int, text: str, **kwargs) -> None:
 
 
 async def deliver_key(bot: Bot, chat_id: int, rk: RenderedKey) -> None:
-    header = f"🔑 <b>{esc(rk.key.name)}</b>\n\n"
+    location = f" · {esc(rk.location)}" if rk.location else ""
+    header = f"🔑 <b>{esc(rk.key.name)}</b>{location}\n\n"
     instruction = "Скопируйте ключ (нажмите на него) и вставьте в AmneziaVPN → «Добавить сервер» → «Вставить ключ»:\n\n"
     body = f"<code>{esc(rk.vpn_url)}</code>"
     if len(header) + len(instruction) + len(body) <= MAX_TEXT:

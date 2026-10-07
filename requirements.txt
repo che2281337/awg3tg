@@ -1,5 +1,6 @@
 aiogram>=3.13,<4
 aiosqlite>=0.20
+asyncssh>=2.14
 cryptography>=42
 python-dotenv>=1.0
 segno>=1.6

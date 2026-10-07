@@ -25,11 +25,24 @@ async def svc(fake_container, tmp_path):
     service = VpnService(settings, db, AwgServer(docker=os.path.join(FAKEBIN, "docker")))
     await service.start()
     yield service
+    await service.close()
     await db.close()
+
+
+async def new_device(svc, user, name):
+    """Устройство на первом (единственном) сервере."""
+    server = (await svc.db.servers())[0]
+    return await svc.create_device(user, name, server.id)
 
 
 def server_conf(root) -> str:
     return (root / "opt" / "amnezia" / "awg" / "awg0.conf").read_text()
+
+
+async def test_local_server_bootstrapped(svc):
+    servers = await svc.db.servers()
+    assert len(servers) == 1
+    assert servers[0].conn == "local" and servers[0].host == "203.0.113.10" and servers[0].status_ok
 
 
 async def test_default_plans_seeded(svc):
@@ -41,23 +54,25 @@ async def test_no_subscription_no_device(svc):
     user, created = await svc.db.touch_user(10, "u10", "User")
     assert created
     with pytest.raises(ServiceError):
-        await svc.create_device(user, "📱 Телефон")
+        await new_device(svc, user, "📱 Телефон")
 
 
 async def test_device_limit_and_key(svc, fake_container):
     user, _ = await svc.db.touch_user(10, "u10", "User")
     await svc.extend(10, 30, devices=1)
-    rk = await svc.create_device(user, "Мой айфон")
+    rk = await new_device(svc, user, "Мой айфон")
     assert rk.key.ip == "10.8.1.2"
     assert rk.filename == "AmneziaWG_1.conf"
+    assert rk.location == "🌐 Основной"
     assert rk.key.public_key in server_conf(fake_container)
     data = decode_vpn_url(rk.vpn_url)
     assert json.loads(data["containers"][0]["awg"]["last_config"])["server_pub_key"] == SERVER_PUB
+    assert data["description"] == "AmneziaWG 🌐 Основной"
     table = json.loads((fake_container / "opt/amnezia/awg/clientsTable").read_text())
     assert table[0]["userData"]["clientName"] == "Мой айфон | @u10"
 
     with pytest.raises(ServiceError, match="лимит"):
-        await svc.create_device(user, "Ноутбук")
+        await new_device(svc, user, "Ноутбук")
 
 
 async def test_newbie_discount(svc):
@@ -88,8 +103,8 @@ async def test_newbie_discount(svc):
 async def test_expiry_disables_and_renewal_restores_same_key(svc, fake_container):
     user, _ = await svc.db.touch_user(10, "u10", "User")
     user = await svc.extend(10, 30, devices=2)
-    rk1 = await svc.create_device(user, "📱 Телефон")
-    rk2 = await svc.create_device(user, "💻 Компьютер")
+    rk1 = await new_device(svc, user, "📱 Телефон")
+    rk2 = await new_device(svc, user, "💻 Компьютер")
 
     # подписка закончилась
     await svc.db.update_user(10, sub_until=now() - 1)
@@ -102,7 +117,7 @@ async def test_expiry_disables_and_renewal_restores_same_key(svc, fake_container
     # пока ключи отключены, их IP не должны достаться другим
     other, _ = await svc.db.touch_user(20, "u20", "Other")
     await svc.extend(20, 30)
-    rk_other = await svc.create_device(other, "📱 Телефон")
+    rk_other = await new_device(svc, other, "📱 Телефон")
     assert rk_other.key.ip not in (rk1.key.ip, rk2.key.ip)
 
     # продление — те же ключи и IP снова на сервере
@@ -117,7 +132,7 @@ async def test_device_limit_downgrade(svc, fake_container):
     user, _ = await svc.db.touch_user(10, "u10", "User")
     await svc.extend(10, 30, devices=3)
     for name in ("a", "b", "c"):
-        await svc.create_device(user, name)
+        await new_device(svc, user, name)
     await svc.set_device_limit(10, 1)
     keys = await svc.db.user_keys(10)
     assert [k.enabled for k in keys] == [1, 0, 0]  # старейшее устройство остаётся
@@ -165,7 +180,7 @@ async def test_payment_and_referral(svc):
 async def test_traffic_accumulates_across_counter_reset(svc, fake_container):
     user, _ = await svc.db.touch_user(10, "u10", "User")
     await svc.extend(10, 30)
-    rk = await svc.create_device(user, "📱 Телефон")
+    rk = await new_device(svc, user, "📱 Телефон")
     await svc.collect_traffic()  # fake awg: rx=1024, tx=2048
     await svc.collect_traffic()  # счётчики не изменились — дельта 0
     t = await svc.db.traffic(tg_id=10)
@@ -175,6 +190,7 @@ async def test_traffic_accumulates_across_counter_reset(svc, fake_container):
     await svc.collect_traffic()
     t = await svc.db.traffic(key_id=rk.key.id)
     assert (t.rx, t.tx) == (2048, 4096)
+    assert (await svc.db.traffic(server_id=rk.key.server_id)).rx == 2048
     key = await svc.db.get_key(rk.key.id)
     assert key.last_handshake == 1700000000
 
@@ -182,7 +198,7 @@ async def test_traffic_accumulates_across_counter_reset(svc, fake_container):
 async def test_ban_and_delete(svc, fake_container):
     user, _ = await svc.db.touch_user(10, "u10", "User")
     await svc.extend(10, 30)
-    rk = await svc.create_device(user, "📱 Телефон")
+    rk = await new_device(svc, user, "📱 Телефон")
     await svc.ban(10)
     assert rk.key.public_key not in server_conf(fake_container)
     await svc.unban(10)
@@ -194,7 +210,7 @@ async def test_ban_and_delete(svc, fake_container):
 
 async def test_admin_needs_no_subscription(svc):
     admin, _ = await svc.db.touch_user(ADMIN, "admin", "Admin")
-    rk = await svc.create_device(admin, "📱 Телефон")
+    rk = await new_device(svc, admin, "📱 Телефон")
     assert rk.key.enabled
     assert await svc.expire_subscriptions() == []
 
@@ -222,7 +238,7 @@ async def test_reminders_and_expiry_notifications(svc, fake_container):
     bot = FakeBot()
     user, _ = await svc.db.touch_user(10, "u10", "User")
     await svc.extend(10, 30)
-    rk = await svc.create_device(user, "📱 Телефон")
+    rk = await new_device(svc, user, "📱 Телефон")
 
     await svc.db.update_user(10, sub_until=now() + 2 * 86400)
     await check_subscriptions(bot, svc)
@@ -242,25 +258,6 @@ async def test_reminders_and_expiry_notifications(svc, fake_container):
     # после продления напоминания снова работают
     await svc.extend(10, 1)
     assert (await svc.db.get_user(10)).notified == 0
-
-
-async def test_mock_server(tmp_path):
-    from bot.awg.mock import MockAwgServer
-
-    settings = Settings(bot_token="x", server_host="127.0.0.1", db_path=str(tmp_path / "bot.db"))
-    db = Database(settings.db_path)
-    await db.connect()
-    service = VpnService(settings, db, MockAwgServer(str(tmp_path / "mock")))
-    await service.start()
-    user, _ = await db.touch_user(10, "u", "U")
-    await service.extend(10, 30, devices=2)
-    rk = await service.create_device(user, "📱 Телефон")
-    assert "HeaderProtectionKey" in rk.conf and rk.key.ip == "10.8.1.1"
-    for _ in range(5):
-        await service.collect_traffic()
-    await service.delete_device(rk.key)
-    assert rk.key.public_key not in (tmp_path / "mock/opt/amnezia/awg/awg0.conf").read_text()
-    await db.close()
 
 
 async def test_huge_values_are_rejected_or_clamped(svc):
@@ -285,3 +282,175 @@ async def test_huge_values_are_rejected_or_clamped(svc):
 
     # если в базе всё же оказалось мусорное значение — экран не ломается
     assert fmt_dt(10**17) == "∞" and fmt_dt(-(10**15)) == "—"
+
+
+# ---------- несколько серверов (демо-эмуляция) ----------
+
+
+@pytest.fixture
+async def multi(tmp_path):
+    settings = Settings(bot_token="x", admin_ids={ADMIN}, db_path=str(tmp_path / "bot.db"), awg_mock=True)
+    db = Database(settings.db_path)
+    await db.connect()
+    service = VpnService(settings, db)
+    await service.start()
+    yield service
+    await service.close()
+    await db.close()
+
+
+def mock_conf(server) -> str:
+    return open(os.path.join(server.conn[5:], "opt/amnezia/awg/awg0.conf"), encoding="utf-8").read()
+
+
+async def test_demo_creates_three_locations(multi):
+    servers = await multi.db.servers()
+    assert [s.title for s in servers] == ["🇩🇪 Германия", "🇳🇱 Нидерланды", "🇫🇮 Финляндия"]
+    assert len(await multi.available_servers()) == 3
+
+
+async def test_devices_on_different_servers_share_limit(multi):
+    de, nl, fi = await multi.db.servers()
+    user, _ = await multi.db.touch_user(10, "u", "U")
+    await multi.extend(10, 30, devices=2)
+    a = await multi.create_device(user, "Телефон", de.id)
+    b = await multi.create_device(user, "Ноутбук", nl.id)
+    assert a.key.public_key in mock_conf(de) and a.key.public_key not in mock_conf(nl)
+    assert b.key.public_key in mock_conf(nl)
+    assert decode_vpn_url(b.vpn_url)["hostName"] == nl.host
+    # лимит общий на все серверы
+    with pytest.raises(ServiceError, match="лимит"):
+        await multi.create_device(user, "Планшет", fi.id)
+
+    # окончание подписки отключает ключи на всех серверах
+    await multi.db.update_user(10, sub_until=now() - 1)
+    await multi.expire_subscriptions()
+    assert a.key.public_key not in mock_conf(de) and b.key.public_key not in mock_conf(nl)
+    await multi.extend(10, 30)
+    assert a.key.public_key in mock_conf(de) and b.key.public_key in mock_conf(nl)
+
+
+async def test_move_device(multi):
+    de, nl, _ = await multi.db.servers()
+    user, _ = await multi.db.touch_user(10, "u", "U")
+    await multi.extend(10, 30)
+    rk = await multi.create_device(user, "Телефон", de.id)
+    moved = await multi.move_device(rk.key, nl.id)
+    assert moved.key.server_id == nl.id and moved.location == "🇳🇱 Нидерланды"
+    assert rk.key.public_key not in mock_conf(de) and rk.key.public_key in mock_conf(nl)
+    assert decode_vpn_url(moved.vpn_url)["hostName"] == nl.host
+    with pytest.raises(ServiceError):
+        await multi.move_device(moved.key, nl.id)
+
+
+async def test_server_down_is_hidden_and_reconciled(multi):
+    de, nl, _ = await multi.db.servers()
+    user, _ = await multi.db.touch_user(10, "u", "U")
+    await multi.extend(10, 30, devices=2)
+    rk = await multi.create_device(user, "Телефон", de.id)
+
+    # «роняем» Германию
+    down = os.path.join(de.conn[5:], "DOWN")
+    open(down, "w").close()
+    await multi.pool.drop(de.id)
+    checks = {c.server.id: c for c in await multi.check_servers()}
+    assert not checks[de.id].ok and checks[de.id].changed
+    assert de.id not in {s.id for s in await multi.available_servers()}
+    with pytest.raises(ServiceError):
+        await multi.create_device(user, "Ноутбук", de.id)  # недоступная локация не выбирается
+
+    # пока сервер лежит, клиент переезжает в Нидерланды — старый пир снять не получилось
+    moved = await multi.move_device(rk.key, nl.id)
+    assert moved.key.server_id == nl.id
+
+    # сервер поднялся: проверка сама снимает «лишний» пир
+    os.remove(down)
+    checks = {c.server.id: c for c in await multi.check_servers()}
+    assert checks[de.id].ok and checks[de.id].changed
+    assert rk.key.public_key not in mock_conf(de)
+
+
+async def test_add_and_delete_server(multi, tmp_path):
+    row = await multi.add_server("Польша", "🇵🇱", "9.9.9.9", f"mock:{tmp_path / 'pl'}")
+    assert row.status_ok and len(await multi.db.servers()) == 4
+    user, _ = await multi.db.touch_user(10, "u", "U")
+    await multi.extend(10, 30)
+    rk = await multi.create_device(user, "Телефон", row.id)
+    with pytest.raises(ServiceError, match="устройства"):
+        await multi.delete_server(row)
+    await multi.delete_device(rk.key)
+    await multi.delete_server(row)
+    assert len(await multi.db.servers()) == 3
+    with pytest.raises(ServiceError, match="Неверное подключение"):
+        await multi.add_server("X", "🏳", "1.1.1.1", "root@host:notaport")
+
+
+async def test_orphan_keys_from_old_version_attach_to_first_server(tmp_path):
+    from bot.awg.mock import MockAwgServer
+
+    settings = Settings(bot_token="x", server_host="127.0.0.1", db_path=str(tmp_path / "bot.db"))
+    db = Database(settings.db_path)
+    await db.connect()
+    await db.touch_user(10, "u", "U")
+    old = await db.add_key(10, "Старый ключ", "PUBKEY=", "PRIVKEY=", "10.8.1.5")  # без server_id
+    assert old.server_id is None
+    service = VpnService(settings, db, MockAwgServer(str(tmp_path / "mock")))
+    await service.start()
+    server = (await db.servers())[0]
+    assert (await db.get_key(old.id)).server_id == server.id
+    await service.close()
+    await db.close()
+
+
+class FakeDocBot:
+    def __init__(self):
+        self.docs = []
+
+    async def send_document(self, chat_id, document, **kw):
+        self.docs.append((chat_id, document))
+
+
+async def test_backup(multi):
+    import io
+    import sqlite3
+    import zipfile
+
+    from bot.scheduler import send_backup
+
+    await multi.db.touch_user(10, "u", "U")
+    multi.pool.ssh.ensure_key()
+    bot = FakeDocBot()
+    assert await send_backup(bot, multi)  # первый раз — сразу
+    assert not await send_backup(bot, multi)  # второй — только через BACKUP_HOURS
+    assert await send_backup(bot, multi, force=True)  # /backup
+    assert len(bot.docs) == 2 and bot.docs[0][0] == ADMIN
+    z = zipfile.ZipFile(io.BytesIO(bot.docs[0][1].data))
+    assert {"data/bot.db", "data/ssh/id_ed25519"} <= set(z.namelist())
+    restored = os.path.join(os.path.dirname(multi.settings.db_path), "restored.db")
+    with open(restored, "wb") as f:
+        f.write(z.read("data/bot.db"))
+    assert sqlite3.connect(restored).execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
+
+
+def test_parse_ssh_target():
+    from bot.awg.runner import parse_ssh_target
+
+    assert parse_ssh_target("5.6.7.8") == ("root", "5.6.7.8", 22)
+    assert parse_ssh_target("admin@5.6.7.8:2222") == ("admin", "5.6.7.8", 2222)
+    assert parse_ssh_target("root@[2001:db8::1]:22") == ("root", "2001:db8::1", 22)
+    for bad in ("root@", "host:port", "host:70000"):
+        with pytest.raises(ValueError):
+            parse_ssh_target(bad)
+
+
+def test_ssh_key_generation(tmp_path):
+    from bot.awg.runner import SshKeyStore
+
+    store = SshKeyStore(str(tmp_path / "ssh"))
+    pub = store.ensure_key()
+    assert pub.startswith("ssh-ed25519 ") and store.ensure_key() == pub  # второй раз не пересоздаётся
+    assert oct(os.stat(store.key_path).st_mode)[-3:] == "600"
+    store.remember("1.2.3.4", 22, "ssh-ed25519 AAA")
+    assert store.known_key("1.2.3.4", 22) == "ssh-ed25519 AAA"
+    store.forget("1.2.3.4", 22)
+    assert store.known_key("1.2.3.4", 22) is None
