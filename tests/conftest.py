@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 
@@ -53,5 +54,40 @@ def fake_container(tmp_path, monkeypatch):
     (awg_dir / "awg0.conf").write_text(SERVER_CONF)
     (awg_dir / "wireguard_server_public_key.key").write_text(SERVER_PUB + "\n")
     (awg_dir / "wireguard_psk.key").write_text(SERVER_PSK + "\n")
+    xray_dir = tmp_path / "opt" / "amnezia" / "xray"
+    xray_dir.mkdir(parents=True)
+    (xray_dir / "server.json").write_text(json.dumps(XRAY_SERVER_JSON, indent=4))
+    (xray_dir / "xray_public.key").write_text(XRAY_PUB + "\n")
+    (xray_dir / "xray_short_id.key").write_text(XRAY_SID + "\n")
     monkeypatch.setenv("FAKE_ROOT", str(tmp_path))
     return tmp_path
+
+
+# Так выглядит server.json, который пишет приложение AmneziaVPN для XRay (VLESS + Reality).
+XRAY_PUB = "Zs8nT-p4bYp9e6kBQf3u0lX4yWZbq2Zc8m0e2fGJ1Ac"
+XRAY_SID = "a1b2c3d4e5f60718"
+XRAY_SERVER_JSON = {
+    "log": {"loglevel": "error"},
+    "inbounds": [
+        {
+            "port": 443,
+            "protocol": "vless",
+            "settings": {
+                "clients": [{"id": "11111111-2222-3333-4444-555555555555", "flow": "xtls-rprx-vision"}],
+                "decryption": "none",
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "dest": "www.googletagmanager.com:443",
+                    "fingerprint": "chrome",
+                    "privateKey": "server-private-key",
+                    "serverNames": ["www.googletagmanager.com"],
+                    "shortIds": [XRAY_SID],
+                },
+            },
+        }
+    ],
+    "outbounds": [{"protocol": "freedom"}],
+}

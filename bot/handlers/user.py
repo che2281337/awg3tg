@@ -9,7 +9,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from ..awg.server import AwgError
-from ..db import Database, User, now
+from ..db import PROTOCOLS, Database, User, now
 from ..service import ServiceError, VpnService
 from ..utils import days_word, devices_word, esc, fmt_date, fmt_dt, human_bytes, left_str, month_start_day, today
 from .common import deliver_key, edit_or_send, help_text, notify_admins
@@ -22,8 +22,11 @@ from .keyboards import (
     MENU_TEXTS,
     AU,
     APay,
+    PROTO_BUTTONS,
+    PROTO_ICONS,
     Buy,
     Dev,
+    DevProto,
     Loc,
     Menu,
     back,
@@ -107,10 +110,12 @@ async def profile_view(db: Database, service: VpnService, user: User) -> tuple[s
         sub = f"⛔ закончилась {fmt_dt(user.sub_until)}"
     else:
         sub = "нет"
+    home = await db.get_server(user.server_id) if user.server_id else None
     text = (
         f"👤 <b>Профиль</b>\n\n"
         f"ID: <code>{user.tg_id}</code>\n"
         f"Подписка: {sub}\n"
+        f"Сервер: {esc(home.title) if home else 'не выбран'}\n"
         f"Устройства: {len(keys)} из {limit}\n\n"
         f"📊 <b>Трафик</b> (скачано / отдано)\n"
         f"Сегодня: {human_bytes(t_today.tx)} / {human_bytes(t_today.rx)}\n"
@@ -119,7 +124,33 @@ async def profile_view(db: Database, service: VpnService, user: User) -> tuple[s
     )
     rows = [[("💳 Продлить подписку" if user.active else "💳 Оформить подписку", Menu(action="plans").pack())]]
     rows.append([("🔑 Мои устройства", Menu(action="devices").pack())])
+    if len(await service.available_servers()) > 1:
+        rows.append([("🌍 Сменить сервер", Loc(action="home").pack())])
     return text, ikb(rows)
+
+
+@router.callback_query(Loc.filter(F.action == "home"))
+async def cb_home_server(call: CallbackQuery, callback_data: Loc, db: Database, service: VpnService, user: User) -> None:
+    servers = await service.available_servers()
+    if not callback_data.sid:
+        await call.answer()
+        rows = [[(("✅ " if s.id == user.server_id else "") + s.title, Loc(action="home", sid=s.id).pack())] for s in servers]
+        rows.append([back(Menu(action="profile"))])
+        await edit_or_send(
+            call,
+            "🌍 Выберите сервер. Новые устройства будут создаваться на нём.\n"
+            "Уже добавленные устройства можно перенести в их карточке («🌍 Сменить локацию»).",
+            ikb(rows),
+        )
+        return
+    if callback_data.sid not in {s.id for s in servers}:
+        await call.answer("Этот сервер сейчас недоступен", show_alert=True)
+        return
+    await service.set_user_server(user.tg_id, callback_data.sid)
+    await call.answer("Сервер изменён")
+    user = await db.get_user(user.tg_id) or user
+    text, kb = await profile_view(db, service, user)
+    await edit_or_send(call, text, kb)
 
 
 @router.message(Command("profile"))
@@ -168,10 +199,13 @@ async def devices_view(db: Database, service: VpnService, user: User) -> tuple[s
             state = "🟢"
         else:
             state = "⚪️"
-        lines.append(f"{state} {flags.get(k.server_id, '❔')} {esc(k.name)}")
+        lines.append(f"{state} {flags.get(k.server_id, '❔')} {esc(k.name)} · {k.protocol_name}")
     if not keys:
         lines.append("Устройств пока нет.")
-    rows = [[(f"{flags.get(k.server_id, '❔')} {k.name}", Dev(action="view", id=k.id).pack())] for k in keys]
+    rows = [
+        [(f"{flags.get(k.server_id, '❔')} {PROTO_ICONS.get(k.protocol, '')} {k.name}", Dev(action="view", id=k.id).pack())]
+        for k in keys
+    ]
     if service.has_access(user) and len(keys) < limit:
         rows.append([("➕ Добавить устройство", Menu(action="add").pack())])
     elif not service.has_access(user):
@@ -208,17 +242,40 @@ async def cb_add_device(call: CallbackQuery, state: FSMContext, db: Database, se
         await call.answer("Сейчас нет доступных серверов, попробуйте чуть позже", show_alert=True)
         return
     await call.answer()
+    # Сервер выбран при покупке тарифа — сразу к выбору протокола.
+    home = await service.user_server(user)
+    if home is not None:
+        await _ask_protocol(call, state, home)
+        return
     if len(servers) == 1:
-        await _ask_device_name(call, state, servers[0].id)
+        await _ask_protocol(call, state, servers[0])
         return
     rows = [[(s.title, Loc(action="new", key=0, sid=s.id).pack())] for s in servers]
     rows.append([back(Menu(action="devices"), "Отмена")])
     await edit_or_send(call, "🌍 Выберите страну сервера:", ikb(rows))
 
 
-async def _ask_device_name(call: CallbackQuery, state: FSMContext, server_id: int) -> None:
+async def _ask_protocol(call: CallbackQuery, state: FSMContext, server) -> None:
+    protocols = server.protocol_list
+    if len(protocols) == 1:
+        await _ask_device_name(call, state, server.id, protocols[0])
+        return
+    rows = [[(PROTO_BUTTONS[p], DevProto(sid=server.id, proto=p).pack())] for p in protocols]
+    rows.append([back(Menu(action="devices"), "Отмена")])
+    await edit_or_send(
+        call,
+        f"Сервер: {esc(server.title)}\n\n🔐 <b>Выберите протокол</b>\n\n"
+        "🛡 <b>AmneziaWG</b> — быстрый, для приложения AmneziaVPN.\n"
+        "⚡ <b>VLESS</b> — маскируется под обычный HTTPS-сайт, хорошо работает там, где блокируют VPN. "
+        "Подходит для AmneziaVPN, v2rayNG, Hiddify, Streisand, FoXray.\n\n"
+        "Если не уверены — начните с AmneziaWG, а при проблемах со связью добавьте VLESS.",
+        ikb(rows),
+    )
+
+
+async def _ask_device_name(call: CallbackQuery, state: FSMContext, server_id: int, protocol: str) -> None:
     await state.set_state(UserStates.device_name)
-    await state.update_data(server_id=server_id)
+    await state.update_data(server_id=server_id, protocol=protocol)
     await edit_or_send(
         call,
         "Введите название устройства, например «Мой айфон» или «Ноутбук».\nОтмена — /cancel",
@@ -228,15 +285,33 @@ async def _ask_device_name(call: CallbackQuery, state: FSMContext, server_id: in
 
 @router.callback_query(Loc.filter(F.action == "new"))
 async def cb_new_location(call: CallbackQuery, callback_data: Loc, state: FSMContext, service: VpnService) -> None:
-    if callback_data.sid not in {s.id for s in await service.available_servers()}:
+    servers = {s.id: s for s in await service.available_servers()}
+    if callback_data.sid not in servers:
         await call.answer("Эта локация сейчас недоступна, выберите другую", show_alert=True)
         return
     await call.answer()
-    await _ask_device_name(call, state, callback_data.sid)
+    await _ask_protocol(call, state, servers[callback_data.sid])
+
+
+@router.callback_query(DevProto.filter())
+async def cb_device_protocol(call: CallbackQuery, callback_data: DevProto, state: FSMContext, service: VpnService) -> None:
+    servers = {s.id: s for s in await service.available_servers(callback_data.proto)}
+    if callback_data.sid not in servers:
+        await call.answer("Этот протокол сейчас недоступен на сервере", show_alert=True)
+        return
+    await call.answer()
+    await _ask_device_name(call, state, callback_data.sid, callback_data.proto)
 
 
 async def _create_and_send(
-    bot: Bot, chat_id: int, db: Database, service: VpnService, user: User, name: str, server_id: int
+    bot: Bot,
+    chat_id: int,
+    db: Database,
+    service: VpnService,
+    user: User,
+    name: str,
+    server_id: int,
+    protocol: str = "awg",
 ) -> None:
     existing = {k.name for k in await db.user_keys(user.tg_id)}
     final, n = name, 2
@@ -244,7 +319,7 @@ async def _create_and_send(
         final, n = f"{name} {n}", n + 1
     wait = await bot.send_message(chat_id, "⏳ Создаю ключ…")
     try:
-        rk = await service.create_device(user, final, server_id)
+        rk = await service.create_device(user, final, server_id, protocol)
     except ServiceError as e:
         await wait.edit_text(f"❌ {e}")
         return
@@ -267,14 +342,14 @@ async def st_device_name(message: Message, bot: Bot, state: FSMContext, db: Data
     data = await state.get_data()
     await state.clear()
     name = message.text.strip()[:40] or "Устройство"
-    server_id = data.get("server_id")
+    server_id, protocol = data.get("server_id"), data.get("protocol", "awg")
     if server_id is None:
-        servers = await service.available_servers()
+        servers = await service.available_servers(protocol)
         if not servers:
             await message.answer("Сейчас нет доступных серверов, попробуйте чуть позже.")
             return
         server_id = servers[0].id
-    await _create_and_send(bot, message.chat.id, db, service, user, name, server_id)
+    await _create_and_send(bot, message.chat.id, db, service, user, name, server_id, protocol)
 
 
 async def _own_key(call: CallbackQuery, db: Database, user: User, key_id: int):
@@ -302,15 +377,16 @@ async def cb_device_view(call: CallbackQuery, callback_data: Dev, db: Database, 
     text = (
         f"🔑 <b>{esc(key.name)}</b>\n\n"
         f"Локация: {esc(location)}\n"
+        f"Протокол: {PROTO_ICONS.get(key.protocol, '')} {key.protocol_name}\n"
         f"Статус: {status}\n"
         f"Добавлено: {fmt_date(key.created_at)}\n"
-        f"Последнее подключение: {fmt_dt(key.last_handshake)}\n\n"
+        f"{'Последнее подключение' if key.protocol == 'awg' else 'Последняя активность'}: {fmt_dt(key.last_handshake)}\n\n"
         f"📊 Трафик (скачано / отдано)\n"
         f"Сегодня: {human_bytes(t_today.tx)} / {human_bytes(t_today.rx)}\n"
         f"За месяц: {human_bytes(t_month.tx)} / {human_bytes(t_month.rx)}\n"
         f"Всего: {human_bytes(t_all.tx)} / {human_bytes(t_all.rx)}"
     )
-    others = [s for s in await service.available_servers() if s.id != key.server_id]
+    others = [s for s in await service.available_servers(key.protocol) if s.id != key.server_id]
     kb = ikb(
         [
             [("📤 Получить ключ", Dev(action="key", id=key.id).pack())],
@@ -327,7 +403,7 @@ async def cb_pick_location(call: CallbackQuery, callback_data: Loc, db: Database
     key = await _own_key(call, db, user, callback_data.key)
     if key is None:
         return
-    others = [s for s in await service.available_servers() if s.id != key.server_id]
+    others = [s for s in await service.available_servers(key.protocol) if s.id != key.server_id]
     if not others:
         await call.answer("Других доступных локаций сейчас нет", show_alert=True)
         return
@@ -483,25 +559,63 @@ async def cb_plans(call: CallbackQuery, db: Database, service: VpnService, user:
 
 @router.callback_query(Buy.filter(F.action == "plan"))
 async def cb_buy_plan(call: CallbackQuery, callback_data: Buy, db: Database, service: VpnService, user: User) -> None:
+    """Шаг 2: после тарифа — выбор сервера (страны)."""
     plan = await db.get_plan(callback_data.plan_id)
     if plan is None or not plan.active:
         await call.answer("Тариф недоступен", show_alert=True)
+        return
+    servers = await service.available_servers()
+    if len(servers) <= 1:  # выбирать не из чего — сразу к оплате
+        await cb_buy_server(call, Buy(action="srv", plan_id=plan.id, sid=servers[0].id if servers else 0), db, service, user)
+        return
+    await call.answer()
+    rows = [
+        [(("✅ " if s.id == user.server_id else "") + s.title, Buy(action="srv", plan_id=plan.id, sid=s.id).pack())]
+        for s in servers
+    ]
+    rows.append([back(Menu(action="plans"))])
+    await edit_or_send(
+        call,
+        f"<b>{esc(plan.title)}</b>\n\n🌍 Выберите сервер (страну). На нём будут создаваться ваши устройства — "
+        "потом его можно сменить в профиле.",
+        ikb(rows),
+    )
+
+
+@router.callback_query(Buy.filter(F.action == "srv"))
+async def cb_buy_server(call: CallbackQuery, callback_data: Buy, db: Database, service: VpnService, user: User) -> None:
+    """Шаг 3: реквизиты для оплаты."""
+    plan = await db.get_plan(callback_data.plan_id)
+    if plan is None or not plan.active:
+        await call.answer("Тариф недоступен", show_alert=True)
+        return
+    server = await db.get_server(callback_data.sid) if callback_data.sid else None
+    if callback_data.sid and (server is None or server.id not in {s.id for s in await service.available_servers()}):
+        await call.answer("Этот сервер сейчас недоступен, выберите другой", show_alert=True)
         return
     await call.answer()
     s = service.settings
     price = await service.price_for(user, plan)
     note = f" <s>{plan.price} {s.currency}</s> — скидка новичка" if price < plan.price else ""
+    where = f"Сервер: {esc(server.title)} ({', '.join(PROTOCOLS[p] for p in server.protocol_list)})\n" if server else ""
     text = (
         f"<b>{esc(plan.title)}</b>\n"
         f"Срок: {days_word(plan.days)}, {devices_word(plan.devices)}\n"
+        f"{where}"
         f"К оплате: <b>{price} {s.currency}</b>{note}\n\n"
         f"{s.payment_details}\n\n"
         "После оплаты нажмите «✅ Я оплатил» и отправьте скриншот или чек."
     )
+    back_to = Buy(action="plan", plan_id=plan.id) if len(await service.available_servers()) > 1 else Menu(action="plans")
     await edit_or_send(
         call,
         text,
-        ikb([[("✅ Я оплатил", Buy(action="paid", plan_id=plan.id).pack())], [back(Menu(action="plans"))]]),
+        ikb(
+            [
+                [("✅ Я оплатил", Buy(action="paid", plan_id=plan.id, sid=callback_data.sid).pack())],
+                [back(back_to)],
+            ]
+        ),
     )
 
 
@@ -516,7 +630,7 @@ async def cb_buy_paid(call: CallbackQuery, callback_data: Buy, state: FSMContext
         return
     await call.answer()
     await state.set_state(UserStates.receipt)
-    await state.update_data(plan_id=callback_data.plan_id)
+    await state.update_data(plan_id=callback_data.plan_id, server_id=callback_data.sid or None)
     await call.message.answer(
         "📎 Отправьте скриншот или чек об оплате (фото, файл или текстом).\n"
         "Чтобы отменить — /cancel"
@@ -552,7 +666,12 @@ async def st_receipt(
     # Цена считается заново на сервере — скидку нельзя «принести» из старой кнопки.
     price = await service.price_for(user, plan)
     title = plan.title + (" (скидка новичка)" if price < plan.price else "")
-    payment = await db.create_payment(user.tg_id, plan, rtype, receipt, amount=price, title=title)
+    server_id = data.get("server_id")
+    if server_id and await db.get_server(server_id) is None:
+        server_id = None
+    payment = await db.create_payment(
+        user.tg_id, plan, rtype, receipt, amount=price, title=title, server_id=server_id
+    )
     await message.answer(
         f"✅ Заявка на оплату №{payment.id} отправлена. Подписка активируется после проверки администратором — "
         "обычно это занимает немного времени. Я пришлю уведомление."
@@ -567,11 +686,13 @@ async def send_payment_to_admins(bot: Bot, service: VpnService, payment_id: int)
         return
     u = await db.get_user(p.tg_id)
     who = esc(u.title) if u else str(p.tg_id)
+    server = await db.get_server(p.server_id) if p.server_id else None
     caption = (
         f"💳 <b>Оплата №{p.id}</b>\n"
         f"От: {who} (<code>{p.tg_id}</code>)\n"
         f"Тариф: {esc(p.title)} — {days_word(p.days)}, {devices_word(p.devices)}\n"
-        f"Сумма: <b>{p.amount} {service.settings.currency}</b>"
+        + (f"Сервер: {esc(server.title)}\n" if server else "")
+        + f"Сумма: <b>{p.amount} {service.settings.currency}</b>"
     )
     if p.receipt_type == "text":
         caption += f"\n\nКомментарий: {esc(p.receipt)}"

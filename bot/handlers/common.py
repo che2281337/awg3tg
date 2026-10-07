@@ -22,10 +22,14 @@ def help_text(support: str) -> str:
         "<b>Как подключиться</b>\n\n"
         "1. Установите <b>AmneziaVPN</b> 5.0.1.5 или новее: https://amnezia.org/downloads "
         "(или из App Store / Google Play).\n"
-        "2. Оформите подписку в разделе «💳 Тарифы».\n"
-        "3. В «🔑 Мои устройства» добавьте устройство и введите его название — придёт ключ <code>vpn://…</code>, файл и QR-код.\n"
+        "2. Оформите подписку в разделе «💳 Тарифы» и выберите сервер (страну).\n"
+        "3. В «🔑 Мои устройства» добавьте устройство: выберите протокол и введите название — придёт ключ и QR-код.\n"
         "4. В AmneziaVPN: <b>«Добавить сервер» → «Вставить ключ»</b> (или «Файл с настройками» / «QR-код»).\n"
         "5. Подключитесь.\n\n"
+        "<b>Какой протокол выбрать?</b>\n"
+        "🛡 <b>AmneziaWG</b> — быстрый, работает в приложении AmneziaVPN.\n"
+        "⚡ <b>VLESS</b> — маскируется под обычный сайт, выручает, когда VPN блокируют. "
+        "Кроме AmneziaVPN, работает в v2rayNG, Hiddify, Streisand, FoXray.\n\n"
         "Один ключ — одно устройство. Для телефона и компьютера добавьте отдельные устройства.\n"
         "Если подписка закончилась, ключи отключаются, а после продления снова работают — "
         "заново ничего настраивать не нужно."
@@ -119,7 +123,21 @@ async def send_long(bot: Bot, chat_id: int, text: str, **kwargs) -> None:
 
 async def deliver_key(bot: Bot, chat_id: int, rk: RenderedKey) -> None:
     location = f" · {esc(rk.location)}" if rk.location else ""
-    header = f"🔑 <b>{esc(rk.key.name)}</b>{location}\n\n"
+    header = f"🔑 <b>{esc(rk.key.name)}</b>{location} · {rk.key.protocol_name}\n\n"
+    if rk.is_vless:
+        await bot.send_message(
+            chat_id,
+            header
+            + "Скопируйте ссылку (нажмите на неё) и добавьте в приложение:\n"
+            "• <b>AmneziaVPN</b> — «Добавить сервер» → «Вставить ключ»;\n"
+            "• <b>v2rayNG</b> (Android) — ➕ → «Импорт из буфера обмена»;\n"
+            "• <b>Hiddify</b>, <b>Streisand</b>, <b>FoXray</b> (iPhone) — ➕ → «Из буфера обмена».\n\n"
+            f"<code>{esc(rk.vpn_url)}</code>",
+        )
+        png = rk.qr_png()
+        if png:
+            await bot.send_photo(chat_id, BufferedInputFile(png, filename="qr.png"), caption="QR-код для сканирования")
+        return
     instruction = "Скопируйте ключ (нажмите на него) и вставьте в AmneziaVPN → «Добавить сервер» → «Вставить ключ»:\n\n"
     body = f"<code>{esc(rk.vpn_url)}</code>"
     if len(header) + len(instruction) + len(body) <= MAX_TEXT:

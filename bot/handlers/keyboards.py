@@ -28,7 +28,7 @@ class Dev(CallbackData, prefix="d"):
 class Loc(CallbackData, prefix="loc"):
     """Выбор локации: new — для нового устройства, pick/move — перенос устройства `key`."""
 
-    action: str
+    action: str  # new | pick | move | home (сервер по умолчанию в профиле)
     key: int = 0
     sid: int = 0
 
@@ -49,8 +49,24 @@ class AMove(CallbackData, prefix="amv"):
 
 
 class Buy(CallbackData, prefix="buy"):
-    action: str  # plan | paid
+    action: str  # plan | srv | paid
     plan_id: int
+    sid: int = 0  # сервер, выбранный при покупке
+
+
+class DevProto(CallbackData, prefix="dp"):
+    """Выбор протокола для нового устройства на сервере sid."""
+
+    sid: int
+    proto: str
+
+
+class AAdd(CallbackData, prefix="aad"):
+    """Админ: создать устройство пользователю uid на сервере sid протоколом proto."""
+
+    uid: int
+    sid: int = 0
+    proto: str = ""
 
 
 class Adm(CallbackData, prefix="a"):
@@ -89,8 +105,8 @@ class APlan(CallbackData, prefix="pl"):
 
 
 class Bcast(CallbackData, prefix="bc"):
-    action: str  # target | send | cancel
-    target: str = "all"
+    action: str  # target | stop
+    target: str = "all"  # all | active | expired | s<id> (клиенты сервера)
 
 
 # ---------- клавиатуры ----------
@@ -120,3 +136,10 @@ def renew_kb() -> InlineKeyboardMarkup:
 
 def back(cb: CallbackData | str, text: str = "⬅️ Назад") -> tuple[str, str]:
     return text, cb if isinstance(cb, str) else cb.pack()
+
+
+PROTO_BUTTONS = {
+    "awg": "🛡 AmneziaWG — приложение AmneziaVPN",
+    "vless": "⚡ VLESS — AmneziaVPN, v2rayNG, Hiddify, Streisand",
+}
+PROTO_ICONS = {"awg": "🛡", "vless": "⚡"}

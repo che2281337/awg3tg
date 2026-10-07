@@ -112,6 +112,7 @@ _MIGRATIONS = {
         "device_limit": "INTEGER NOT NULL DEFAULT 0",
         "notified": "INTEGER NOT NULL DEFAULT 0",
         "ref_rewarded": "INTEGER NOT NULL DEFAULT 0",
+        "server_id": "INTEGER",  # сервер, выбранный при покупке тарифа (для новых устройств)
     },
     "keys": {
         "enabled": "INTEGER NOT NULL DEFAULT 1",
@@ -119,11 +120,21 @@ _MIGRATIONS = {
         "last_rx": "INTEGER NOT NULL DEFAULT 0",
         "last_tx": "INTEGER NOT NULL DEFAULT 0",
         "server_id": "INTEGER",
+        # awg: public_key/private_key/ip — ключи WireGuard; vless: public_key = UUID клиента
+        "protocol": "TEXT NOT NULL DEFAULT 'awg'",
     },
     "traffic_daily": {
         "server_id": "INTEGER",
     },
+    "servers": {
+        "protocols": "TEXT NOT NULL DEFAULT ''",  # найденные на сервере: «awg,vless»
+    },
+    "payments": {
+        "server_id": "INTEGER",
+    },
 }
+
+PROTOCOLS = {"awg": "AmneziaWG", "vless": "VLESS"}
 
 # Индексы по колонкам, которые могли появиться только после миграции.
 POST_MIGRATION = """
@@ -150,6 +161,7 @@ class User:
     device_limit: int
     notified: int
     ref_rewarded: int
+    server_id: int | None
 
     @property
     def title(self) -> str:
@@ -174,10 +186,15 @@ class Server:
     status_ok: int
     last_error: str | None
     last_check: int
+    protocols: str
 
     @property
     def title(self) -> str:
         return f"{self.flag} {self.name}"
+
+    @property
+    def protocol_list(self) -> list[str]:
+        return [p for p in self.protocols.split(",") if p in PROTOCOLS]
 
 
 @dataclass
@@ -194,6 +211,11 @@ class Key:
     last_handshake: int
     last_rx: int
     last_tx: int
+    protocol: str
+
+    @property
+    def protocol_name(self) -> str:
+        return PROTOCOLS.get(self.protocol, self.protocol)
 
 
 @dataclass
@@ -222,6 +244,7 @@ class Payment:
     created_at: int
     decided_at: int | None
     admin_id: int | None
+    server_id: int | None
 
 
 @dataclass
@@ -375,6 +398,15 @@ class Database:
         async with self.c.execute(f"SELECT tg_id FROM users WHERE {where}", args) as cur:
             return [r[0] for r in await cur.fetchall()]
 
+    async def server_user_ids(self, server_id: int) -> list[int]:
+        """Клиенты сервера: есть устройство на нём или он выбран при покупке."""
+        async with self.c.execute(
+            """SELECT tg_id FROM users WHERE banned = 0 AND (server_id = ? OR tg_id IN
+               (SELECT tg_id FROM keys WHERE server_id = ? AND tg_id IS NOT NULL))""",
+            (server_id, server_id),
+        ) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
     async def users_to_expire(self) -> list[User]:
         """Подписка кончилась, а включённые ключи ещё есть."""
         return await self._all(
@@ -461,12 +493,19 @@ class Database:
     # ---------- keys ----------
 
     async def add_key(
-        self, tg_id: int | None, name: str, public_key: str, private_key: str, ip: str, server_id: int | None = None
+        self,
+        tg_id: int | None,
+        name: str,
+        public_key: str,
+        private_key: str,
+        ip: str,
+        server_id: int | None = None,
+        protocol: str = "awg",
     ) -> Key:
         cur = await self.c.execute(
-            """INSERT INTO keys (tg_id, server_id, name, public_key, private_key, ip, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (tg_id, server_id, name, public_key, private_key, ip, now()),
+            """INSERT INTO keys (tg_id, server_id, name, public_key, private_key, ip, created_at, protocol)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (tg_id, server_id, name, public_key, private_key, ip, now(), protocol),
         )
         await self.c.commit()
         key = await self.get_key(cur.lastrowid)
@@ -482,10 +521,15 @@ class Database:
     async def all_keys(self) -> list[Key]:
         return await self._all(Key, "SELECT * FROM keys ORDER BY id")
 
-    async def enabled_keys(self, server_id: int | None = None) -> list[Key]:
-        if server_id is None:
-            return await self._all(Key, "SELECT * FROM keys WHERE enabled = 1")
-        return await self._all(Key, "SELECT * FROM keys WHERE enabled = 1 AND server_id = ?", (server_id,))
+    async def enabled_keys(self, server_id: int | None = None, protocol: str | None = None) -> list[Key]:
+        cond, args = ["enabled = 1"], []
+        if server_id is not None:
+            cond.append("server_id = ?")
+            args.append(server_id)
+        if protocol is not None:
+            cond.append("protocol = ?")
+            args.append(protocol)
+        return await self._all(Key, f"SELECT * FROM keys WHERE {' AND '.join(cond)}", tuple(args))
 
     async def server_keys(self, server_id: int) -> list[Key]:
         return await self._all(Key, "SELECT * FROM keys WHERE server_id = ? ORDER BY id", (server_id,))
@@ -493,9 +537,9 @@ class Database:
     async def reserved_ips(self, server_id: int | None = None) -> set[str]:
         """IP, занятые ключами из БД на данном сервере (в т.ч. отключёнными)."""
         if server_id is None:
-            sql, args = "SELECT ip FROM keys", ()
+            sql, args = "SELECT ip FROM keys WHERE ip != ''", ()
         else:
-            sql, args = "SELECT ip FROM keys WHERE server_id = ?", (server_id,)
+            sql, args = "SELECT ip FROM keys WHERE server_id = ? AND ip != ''", (server_id,)
         async with self.c.execute(sql, args) as cur:
             return {r[0] for r in await cur.fetchall()}
 
@@ -587,11 +631,20 @@ class Database:
     # ---------- payments ----------
 
     async def create_payment(
-        self, tg_id: int, plan: Plan, receipt_type: str, receipt: str, *, amount: int | None = None, title: str | None = None
+        self,
+        tg_id: int,
+        plan: Plan,
+        receipt_type: str,
+        receipt: str,
+        *,
+        amount: int | None = None,
+        title: str | None = None,
+        server_id: int | None = None,
     ) -> Payment:
         cur = await self.c.execute(
-            """INSERT INTO payments (tg_id, plan_id, title, days, devices, amount, receipt_type, receipt, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO payments
+               (tg_id, plan_id, title, days, devices, amount, receipt_type, receipt, created_at, server_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 tg_id,
                 plan.id,
@@ -602,6 +655,7 @@ class Database:
                 receipt_type,
                 receipt,
                 now(),
+                server_id,
             ),
         )
         await self.c.commit()

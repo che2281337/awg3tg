@@ -454,3 +454,130 @@ def test_ssh_key_generation(tmp_path):
     assert store.known_key("1.2.3.4", 22) == "ssh-ed25519 AAA"
     store.forget("1.2.3.4", 22)
     assert store.known_key("1.2.3.4", 22) is None
+
+
+# ---------- VLESS (Xray от Amnezia) ----------
+
+
+def xray_conf(root) -> dict:
+    return json.loads((root / "opt" / "amnezia" / "xray" / "server.json").read_text())
+
+
+def xray_ids(root) -> list[str]:
+    return [c["id"] for c in xray_conf(root)["inbounds"][0]["settings"]["clients"]]
+
+
+async def test_local_server_has_both_protocols(svc):
+    server = (await svc.db.servers())[0]
+    assert server.protocol_list == ["awg", "vless"]
+
+
+async def test_vless_device(svc, fake_container):
+    from urllib.parse import parse_qs, urlparse
+
+    from .conftest import XRAY_PUB, XRAY_SID
+
+    user, _ = await svc.db.touch_user(10, "u10", "User")
+    await svc.extend(10, 30, devices=2)
+    server = (await svc.db.servers())[0]
+    rk = await svc.create_device(user, "Ноутбук", server.id, "vless")
+    assert rk.is_vless and rk.conf == "" and rk.key.ip == ""
+    url = urlparse(rk.vpn_url)
+    q = {k: v[0] for k, v in parse_qs(url.query).items()}
+    assert url.scheme == "vless" and url.username == rk.key.public_key
+    assert url.hostname == "203.0.113.10" and url.port == 443
+    assert q == {
+        "type": "tcp", "encryption": "none", "security": "reality", "flow": "xtls-rprx-vision",
+        "sni": "www.googletagmanager.com", "fp": "chrome", "pbk": XRAY_PUB, "sid": XRAY_SID,
+    }
+    cfg = xray_conf(fake_container)
+    client = cfg["inbounds"][0]["settings"]["clients"][-1]
+    assert client == {"id": rk.key.public_key, "email": rk.key.public_key, "flow": "xtls-rprx-vision"}
+    assert cfg["inbounds"][0]["settings"]["clients"][0]["id"].startswith("11111111")  # клиент из приложения цел
+    assert "StatsService" in cfg["api"]["services"]  # включена статистика
+    assert (fake_container / "restarts").read_text().split() == ["amnezia-xray"]
+    table = json.loads((fake_container / "opt/amnezia/xray/clientsTable").read_text())
+    assert table[0] == {"clientId": rk.key.public_key, "userData": table[0]["userData"]}
+    assert table[0]["userData"]["clientName"] == "Ноутбук | @u10"
+    assert rk.qr_png()
+
+    # трафик из Stats API
+    await svc.collect_traffic()
+    t = await svc.db.traffic(key_id=rk.key.id)
+    assert (t.rx, t.tx) == (4096, 8192)
+    assert (await svc.db.get_key(rk.key.id)).last_handshake > 0
+
+    # окончание подписки — клиент снят; продление — тот же UUID вернулся
+    await svc.db.update_user(10, sub_until=now() - 1)
+    await svc.expire_subscriptions()
+    assert rk.key.public_key not in xray_ids(fake_container)
+    await svc.extend(10, 30)
+    assert rk.key.public_key in xray_ids(fake_container)
+    assert (await svc.render(await svc.db.get_key(rk.key.id))).vpn_url == rk.vpn_url
+
+    await svc.delete_device(await svc.db.get_key(rk.key.id))
+    assert rk.key.public_key not in xray_ids(fake_container)
+
+
+async def test_vless_falls_back_when_xray_rejects_stats_api(svc, fake_container, monkeypatch):
+    monkeypatch.setenv("FAKE_XRAY_REJECT_API", "1")
+    user, _ = await svc.db.touch_user(10, "u", "U")
+    await svc.extend(10, 30)
+    server = (await svc.db.servers())[0]
+    rk = await svc.create_device(user, "Телефон", server.id, "vless")
+    cfg = xray_conf(fake_container)
+    assert rk.key.public_key in xray_ids(fake_container) and "api" not in cfg
+
+
+async def test_vless_broken_config_is_not_applied(svc, fake_container):
+    xray_dir = fake_container / "opt" / "amnezia" / "xray"
+    from bot.awg.xray import XrayServer
+
+    xs = XrayServer(container="amnezia-xray", docker=os.path.join(FAKEBIN, "docker"))
+    original = (xray_dir / "server.json").read_text()
+    # «Xray» отклоняет всё: подменяем проверку
+    async def always_bad(path):
+        return "config error"
+    xs._config_ok = always_bad
+    from bot.awg.server import AwgError
+
+    with pytest.raises(AwgError, match="не принял"):
+        await xs.add_client("x")
+    assert (xray_dir / "server.json").read_text() == original  # рабочий конфиг не тронут
+    assert not (fake_container / "restarts").exists()
+
+
+async def test_vless_unavailable_protocol(svc, fake_container):
+    import shutil
+
+    shutil.rmtree(fake_container / "opt" / "amnezia" / "xray")
+    await svc.pool.drop((await svc.db.servers())[0].id)
+    await svc.check_servers()
+    server = (await svc.db.servers())[0]
+    assert server.protocol_list == ["awg"] and server.status_ok  # AWG работает, VLESS пропал
+    assert "VLESS" in (server.last_error or "")
+    user, _ = await svc.db.touch_user(10, "u", "U")
+    await svc.extend(10, 30)
+    with pytest.raises(ServiceError, match="VLESS"):
+        await svc.create_device(user, "Телефон", server.id, "vless")
+
+
+async def test_multi_vless_move_and_preferred_server(multi):
+    de, nl, _ = await multi.db.servers()
+    assert de.protocol_list == ["awg", "vless"]
+    user, _ = await multi.db.touch_user(10, "u", "U")
+    plan = (await multi.db.plans())[0]
+    p = await multi.db.create_payment(10, plan, "text", "чек", server_id=nl.id)
+    await multi.confirm_payment(p.id, ADMIN)
+    user = await multi.db.get_user(10)
+    assert user.server_id == nl.id and (await multi.user_server(user)).id == nl.id
+
+    rk = await multi.create_device(user, "Ноутбук", nl.id, "vless")
+    moved = await multi.move_device(rk.key, de.id)
+    assert moved.key.protocol == "vless" and moved.key.public_key == rk.key.public_key
+    from bot.awg.mock import MockXrayServer
+
+    de_ids = MockXrayServer.client_ids(json.load(open(os.path.join(de.conn[5:], "opt/amnezia/xray/server.json"))))
+    nl_ids = MockXrayServer.client_ids(json.load(open(os.path.join(nl.conn[5:], "opt/amnezia/xray/server.json"))))
+    assert rk.key.public_key in de_ids and rk.key.public_key not in nl_ids
+    assert "@10.0.0.1:443" in moved.vpn_url

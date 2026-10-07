@@ -2,7 +2,8 @@
 # Поддельный docker для тестов: «контейнер» — это каталог $FAKE_ROOT.
 set -e
 case "$1" in
-  ps) echo "some-other"; echo "amnezia-awg2" ;;
+  ps) echo "some-other"; echo "amnezia-awg2"; [ -f "$FAKE_ROOT/opt/amnezia/xray/server.json" ] && echo "amnezia-xray"; true ;;
+  restart) echo "$2" >> "$FAKE_ROOT/restarts" ;;
   exec)
     shift
     [ "$1" = "-i" ] && shift

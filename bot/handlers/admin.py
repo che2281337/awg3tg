@@ -9,9 +9,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
-from ..awg.conf import protocol_version
 from ..awg.server import AwgError
-from ..db import Database, User, now
+from ..db import PROTOCOLS, Database, User, now
 from ..service import MAX_DAYS, MAX_DEVICES, ServiceError, VpnService
 from ..utils import (
     day_start_ts,
@@ -28,7 +27,23 @@ from ..utils import (
     today,
 )
 from .common import deliver_key, edit_or_send, send_long
-from .keyboards import AK, AU, BTN_ADMIN, MENU_TEXTS, Adm, AMove, APay, APlan, ASrv, Bcast, UList, back, ikb, main_menu
+from .keyboards import (
+    AK,
+    AU,
+    BTN_ADMIN,
+    MENU_TEXTS,
+    AAdd,
+    Adm,
+    AMove,
+    APay,
+    APlan,
+    ASrv,
+    Bcast,
+    UList,
+    back,
+    ikb,
+    main_menu,
+)
 
 log = logging.getLogger(__name__)
 router = Router(name="admin")
@@ -38,6 +53,7 @@ MAX_PLAN_DAYS = 3650
 MAX_PRICE = 10_000_000
 FILTERS = {"all": "Все", "active": "С подпиской", "expired": "Без подписки", "banned": "Бан"}
 BCAST_TARGETS = {"all": "всем", "active": "с активной подпиской", "expired": "без подписки"}
+PROTO_SHORT = {"awg": "AWG", "vless": "VLESS"}
 
 
 def _is_admin(event: TelegramObject, service: VpnService) -> bool:
@@ -65,7 +81,7 @@ def panel_kb(pending: int):
         [
             [("👥 Пользователи", UList(flt="all").pack()), (f"💳 Платежи ({pending})", Adm(action="payments").pack())],
             [("📊 Статистика", Adm(action="stats").pack()), ("📦 Тарифы", Adm(action="plans").pack())],
-            [("📢 Рассылка", Adm(action="bcast").pack()), ("🖥 Серверы", ASrv(action="list").pack())],
+            [("📢 Оповещение всем", Adm(action="bcast").pack()), ("🖥 Серверы", ASrv(action="list").pack())],
             [("🧹 Неактивные", Adm(action="inactive", arg=30).pack()), ("🔎 Поиск", Adm(action="find").pack())],
         ]
     )
@@ -455,36 +471,52 @@ async def cb_user_keys(call: CallbackQuery, callback_data: AU, db: Database, ser
         t = await db.traffic(key_id=k.id, since=month_start_day())
         state = "⏸" if not k.enabled else ("🟢" if k.last_handshake >= now() - 180 else "⚪️")
         lines.append(
-            f"{state} {flags.get(k.server_id, '❔')} #{k.id} {esc(k.name)} · {k.ip} · был {fmt_dt(k.last_handshake)}"
-            f" · за месяц {human_bytes(t.total)}"
+            f"{state} {flags.get(k.server_id, '❔')} #{k.id} {esc(k.name)} · {PROTO_SHORT.get(k.protocol, k.protocol)}"
+            f" · был {fmt_dt(k.last_handshake)} · за месяц {human_bytes(t.total)}"
         )
     if not keys:
         lines.append("Устройств нет.")
-    rows = [[(f"{flags.get(k.server_id, '❔')} #{k.id} {k.name}", AK(action="view", id=k.id).pack())] for k in keys]
-    rows.append([("➕ Создать устройство", AU(action="addkey", uid=uid).pack())])
+    rows = [
+        [(f"{flags.get(k.server_id, '❔')} #{k.id} {PROTO_SHORT.get(k.protocol, '')} {k.name}", AK(action="view", id=k.id).pack())]
+        for k in keys
+    ]
+    rows.append([("➕ Создать устройство", AAdd(uid=uid).pack())])
     rows.append([back(AU(action="card", uid=uid))])
     await edit_or_send(call, "\n".join(lines), ikb(rows))
 
 
-@router.callback_query(AU.filter(F.action == "addkey"))
-async def cb_user_addkey(call: CallbackQuery, callback_data: AU, bot: Bot, db: Database, service: VpnService) -> None:
+@router.callback_query(AAdd.filter())
+async def cb_user_addkey(call: CallbackQuery, callback_data: AAdd, bot: Bot, db: Database, service: VpnService) -> None:
     u = await db.get_user(callback_data.uid)
     if u is None:
         await call.answer("Не найден", show_alert=True)
         return
-    if not callback_data.arg:  # сначала выбираем сервер
-        servers = [s for s in await db.servers() if s.status_ok]
+    if not callback_data.sid:  # 1) сервер
+        servers = [s for s in await db.servers() if s.status_ok and s.protocol_list]
         if not servers:
             await call.answer("Нет работающих серверов", show_alert=True)
             return
         await call.answer()
-        rows = [[(s.title, AU(action="addkey", uid=u.tg_id, arg=s.id).pack())] for s in servers]
+        rows = [[(s.title, AAdd(uid=u.tg_id, sid=s.id).pack())] for s in servers]
         rows.append([back(AU(action="keys", uid=u.tg_id))])
         await edit_or_send(call, "На каком сервере создать устройство?", ikb(rows))
         return
+    server = await db.get_server(callback_data.sid)
+    if server is None:
+        await call.answer("Сервер не найден", show_alert=True)
+        return
+    if not callback_data.proto:  # 2) протокол
+        if len(server.protocol_list) == 1:
+            callback_data = AAdd(uid=u.tg_id, sid=server.id, proto=server.protocol_list[0])
+        else:
+            await call.answer()
+            rows = [[(PROTOCOLS[p], AAdd(uid=u.tg_id, sid=server.id, proto=p).pack())] for p in server.protocol_list]
+            rows.append([back(AAdd(uid=u.tg_id))])
+            await edit_or_send(call, f"Протокол для устройства на {esc(server.title)}:", ikb(rows))
+            return
     n = len(await db.user_keys(u.tg_id)) + 1
     try:
-        rk = await service.create_device(u, f"Устройство {n}", callback_data.arg, force=True)
+        rk = await service.create_device(u, f"Устройство {n}", server.id, callback_data.proto, force=True)
     except (ServiceError, AwgError) as e:
         await call.answer(str(e)[:190], show_alert=True)
         return
@@ -507,12 +539,13 @@ async def cb_key_view(call: CallbackQuery, callback_data: AK, db: Database) -> N
     text = (
         f"🔑 <b>#{key.id} {esc(key.name)}</b>\n"
         f"Владелец: <code>{key.tg_id}</code>\n"
-        f"Сервер: {esc(server.title) if server else '❔ удалён'}\nIP: {key.ip}\n"
+        f"Сервер: {esc(server.title) if server else '❔ удалён'}\n"
+        f"Протокол: {key.protocol_name}" + (f", IP {key.ip}" if key.ip else "") + "\n"
         f"Статус: {'✅ активен' if key.enabled else '⏸ отключён'}\n"
-        f"Создан: {fmt_dt(key.created_at)}\nПоследнее подключение: {fmt_dt(key.last_handshake)}\n"
+        f"Создан: {fmt_dt(key.created_at)}\nПоследняя активность: {fmt_dt(key.last_handshake)}\n"
         f"Трафик за месяц: ↓{human_bytes(t_month.tx)} ↑{human_bytes(t_month.rx)}\n"
         f"Всего: ↓{human_bytes(t_all.tx)} ↑{human_bytes(t_all.rx)}\n"
-        f"Публичный ключ: <code>{esc(key.public_key)}</code>"
+        f"{'UUID' if key.protocol == 'vless' else 'Публичный ключ'}: <code>{esc(key.public_key)}</code>"
     )
     rows = [
         [("📤 Получить ключ", AK(action="key", id=key.id).pack()), ("🗑 Удалить", AK(action="del", id=key.id).pack())],
@@ -530,9 +563,11 @@ async def cb_key_move(call: CallbackQuery, callback_data: AMove, bot: Bot, db: D
         await call.answer("Ключ не найден", show_alert=True)
         return
     if not callback_data.sid:
-        targets = [s for s in await db.servers() if s.id != key.server_id and s.status_ok]
+        targets = [
+            s for s in await db.servers() if s.id != key.server_id and s.status_ok and key.protocol in s.protocol_list
+        ]
         if not targets:
-            await call.answer("Нет других работающих серверов", show_alert=True)
+            await call.answer(f"Нет других работающих серверов с {key.protocol_name}", show_alert=True)
             return
         await call.answer()
         rows = [[(s.title, AMove(key=key.id, sid=s.id).pack())] for s in targets]
@@ -823,68 +858,99 @@ async def cb_plan_del(call: CallbackQuery, callback_data: APlan, db: Database, s
 # ---------- рассылка ----------
 
 
+#
+# Режим оповещения: админ выбирает аудиторию, и дальше КАЖДОЕ его сообщение
+# (текст, фото, видео, файл) бот сразу пересылает всем. Удобно, когда, например,
+# сервер заблокировали и нужно быстро объяснить клиентам, что происходит.
+
+_BROADCAST_TASKS: set[asyncio.Task] = set()
+
+
+async def _audience(db: Database, target: str) -> tuple[list[int], str]:
+    if target.startswith("s") and target[1:].isdigit():
+        server = await db.get_server(int(target[1:]))
+        title = f"клиентам сервера {server.title}" if server else "клиентам удалённого сервера"
+        return await db.server_user_ids(int(target[1:])), title
+    return await db.all_user_ids(target), BCAST_TARGETS.get(target, target)
+
+
+def _stop_kb():
+    return ikb([[("⏹ Выйти из режима оповещения", Bcast(action="stop").pack())]])
+
+
 @router.callback_query(Adm.filter(F.action == "bcast"))
-async def cb_bcast(call: CallbackQuery) -> None:
+async def cb_bcast(call: CallbackQuery, db: Database) -> None:
     await call.answer()
-    rows = [[(f"Отправить {title}", Bcast(action="target", target=t).pack())] for t, title in BCAST_TARGETS.items()]
+    rows = [[(f"📢 {title.capitalize()}", Bcast(action="target", target=t).pack())] for t, title in BCAST_TARGETS.items()]
+    for s in await db.servers():
+        rows.append([(f"📢 Клиентам {s.title}", Bcast(action="target", target=f"s{s.id}").pack())])
     rows.append([back(Adm(action="panel"))])
-    await edit_or_send(call, "📢 <b>Рассылка</b>\nКому отправить?", ikb(rows))
+    await edit_or_send(
+        call,
+        "📢 <b>Оповещение</b>\n\nКому пишем? После выбора все ваши сообщения будут сразу пересылаться "
+        "выбранным пользователям — пока не нажмёте «⏹ Выйти».\n\n"
+        "«Клиентам сервера» — тем, у кого есть устройства на этом сервере или кто выбрал его при покупке "
+        "(удобно, если заблокировали конкретный сервер).",
+        ikb(rows),
+    )
 
 
 @router.callback_query(Bcast.filter(F.action == "target"))
-async def cb_bcast_target(call: CallbackQuery, callback_data: Bcast, state: FSMContext) -> None:
+async def cb_bcast_target(call: CallbackQuery, callback_data: Bcast, state: FSMContext, db: Database) -> None:
+    ids, title = await _audience(db, callback_data.target)
     await call.answer()
     await state.set_state(AdminStates.broadcast)
     await state.update_data(target=callback_data.target)
     await call.message.answer(
-        f"Отправьте сообщение для рассылки ({BCAST_TARGETS[callback_data.target]}): текст, фото, видео. /cancel — отмена."
+        f"📢 <b>Режим оповещения включён</b> — {esc(title)} ({len(ids)} чел.).\n\n"
+        "Пишите сообщения — текст, фото, видео, файлы. Каждое сразу уйдёт всем адресатам.\n"
+        "Выйти — кнопкой ниже или /cancel.",
+        reply_markup=_stop_kb(),
     )
 
 
 @router.message(AdminStates.broadcast, ~F.text.in_(MENU_TEXTS))
-async def st_bcast(message: Message, state: FSMContext, db: Database) -> None:
+async def st_bcast(message: Message, bot: Bot, state: FSMContext, db: Database) -> None:
     if message.text and message.text.startswith("/"):
         await state.clear()
-        await message.answer("Отменено.")
+        await message.answer("📢 Режим оповещения выключен.")
         return
     data = await state.get_data()
-    target = data.get("target", "all")
-    ids = await db.all_user_ids(target)
-    await state.update_data(msg_id=message.message_id, chat_id=message.chat.id)
-    await message.answer(
-        f"Отправить это сообщение {len(ids)} пользователям ({BCAST_TARGETS[target]})?",
-        reply_markup=ikb(
-            [[("✅ Отправить", Bcast(action="send", target=target).pack()), ("Отмена", Bcast(action="cancel").pack())]]
-        ),
-    )
-
-
-@router.callback_query(Bcast.filter(F.action == "cancel"))
-async def cb_bcast_cancel(call: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    await call.answer("Отменено")
-    await edit_or_send(call, "Рассылка отменена.")
-
-
-@router.callback_query(Bcast.filter(F.action == "send"))
-async def cb_bcast_send(call: CallbackQuery, callback_data: Bcast, bot: Bot, state: FSMContext, db: Database) -> None:
-    data = await state.get_data()
-    await state.clear()
-    if "msg_id" not in data:
-        await call.answer("Сообщение не найдено, начните заново", show_alert=True)
+    ids, title = await _audience(db, data.get("target", "all"))
+    ids = [uid for uid in ids if uid != message.chat.id]
+    if not ids:
+        await message.answer("Некому отправлять — в этой аудитории нет пользователей.", reply_markup=_stop_kb())
         return
-    await call.answer("Рассылка запущена")
-    await edit_or_send(call, "📢 Рассылка идёт…")
-    ids = await db.all_user_ids(callback_data.target)
-    ok = 0
-    for uid in ids:
+    status = await message.answer(f"📤 Отправляю {len(ids)} пользователям ({esc(title)})…")
+
+    async def run() -> None:
+        ok = 0
+        for uid in ids:
+            try:
+                await bot.copy_message(uid, message.chat.id, message.message_id)
+                ok += 1
+            except Exception:
+                pass  # заблокировал бота и т.п.
+            await asyncio.sleep(0.05)  # лимит Telegram ~30 сообщений/сек
         try:
-            await bot.copy_message(uid, data["chat_id"], data["msg_id"])
-            ok += 1
+            await status.edit_text(
+                f"✅ Доставлено {ok} из {len(ids)} ({esc(title)}). Можно писать следующее сообщение.",
+                reply_markup=_stop_kb(),
+            )
         except Exception:
             pass
-        await asyncio.sleep(0.05)  # лимит Telegram ~30 сообщений/сек
-    await bot.send_message(call.from_user.id, f"📢 Рассылка завершена: доставлено {ok} из {len(ids)}.")
+
+    # Отправка идёт в фоне: бот не «замирает», пока рассылка не закончится.
+    task = asyncio.create_task(run())
+    _BROADCAST_TASKS.add(task)
+    task.add_done_callback(_BROADCAST_TASKS.discard)
+
+
+@router.callback_query(Bcast.filter(F.action == "stop"))
+async def cb_bcast_stop(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await call.answer("Режим оповещения выключен")
+    await call.message.answer("📢 Режим оповещения выключен.", reply_markup=main_menu(True))
 
 
 # ---------- серверы ----------
@@ -909,7 +975,8 @@ async def cb_servers(call: CallbackQuery, state: FSMContext, db: Database) -> No
     for s in servers:
         total, _, online = counts.get(s.id, (0, 0, 0))
         mark = ("🟢" if s.status_ok else "🔴") + ("" if s.active else "🙈")
-        label = f"{mark} {s.title} · {total} устр. · онлайн {online}"
+        protos = "+".join(PROTO_SHORT[p] for p in s.protocol_list) or "—"
+        label = f"{mark} {s.title} · {protos} · {total} устр. · онлайн {online}"
         lines.append(esc(label))
         rows.append([(label, ASrv(action="view", id=s.id).pack())])
     if not servers:
@@ -939,18 +1006,16 @@ async def server_card(db: Database, service: VpnService, row) -> tuple[str, obje
         f"Подключение: {esc(_conn_label(row.conn))}",
         f"Проверен: {fmt_dt(row.last_check)}",
     ]
-    if row.last_error and not row.status_ok:
+    if row.last_error:
         lines.append(f"Ошибка: <code>{esc(row.last_error[:400])}</code>")
     lines.append(f"\nУстройств в боте: {total} (активных {enabled})")
-    try:
-        info, peers, online = await service.server_details(row)
-        version = protocol_version(info.awg_params) or "1.0 / WireGuard"
-        lines += [
-            f"AmneziaWG: <b>{version}</b>, порт {info.port}, контейнер <code>{esc(info.container)}</code>",
-            f"Пиров на сервере: {peers}, онлайн сейчас: {online}",
-        ]
-    except (AwgError, ServiceError) as e:
-        lines.append(f"Детали недоступны: <code>{esc(str(e)[:300])}</code>")
+    details = await service.server_details(row) if row.status_ok else {}
+    lines.append("\n<b>Протоколы:</b>")
+    for proto, title in PROTOCOLS.items():
+        if proto in details:
+            lines.append(f"✅ {title}: {esc(details[proto])}")
+        else:
+            lines.append(f"— {title}: не найден на сервере")
     lines += [
         f"\n📶 Трафик сегодня: {human_bytes(t_today.total)}, за месяц: {human_bytes(t_month.total)}",
     ]
@@ -1026,7 +1091,7 @@ async def cb_server_resetkey(call: CallbackQuery, callback_data: ASrv, db: Datab
 def _ssh_help(pubkey: str) -> str:
     return (
         "➕ <b>Добавление сервера</b>\n\n"
-        "1. Установите на сервер AmneziaWG через приложение AmneziaVPN (как обычно).\n"
+        "1. Установите на сервер AmneziaWG и/или XRay (VLESS) через приложение AmneziaVPN (как обычно).\n"
         "2. Разрешите боту вход по SSH — выполните на этом сервере одну команду:\n"
         f"<pre>mkdir -p ~/.ssh &amp;&amp; echo '{esc(pubkey)}' &gt;&gt; ~/.ssh/authorized_keys</pre>\n"
         "3. Отправьте сюда строку:\n"

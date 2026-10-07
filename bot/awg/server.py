@@ -69,22 +69,16 @@ def qt_date_now() -> str:
     return now.strftime("%a %b ") + str(now.day) + now.strftime(" %H:%M:%S %Y")
 
 
-class AwgServer:
-    def __init__(
-        self,
-        container: str | None = None,
-        config_path: str | None = None,
-        interface: str | None = None,
-        binary: str | None = None,
-        docker: str = "docker",
-        runner: Runner | None = None,
-    ) -> None:
+class ContainerClient:
+    """Доступ к docker-контейнеру Amnezia на сервере (локально или по SSH)."""
+
+    def __init__(self, container: str | None = None, docker: str = "docker", runner: Runner | None = None) -> None:
         self.container = container
-        self._config_path = config_path
-        self._interface = interface
-        self._binary = binary
         self.runner = runner or LocalRunner(docker)
         self._lock = asyncio.Lock()
+
+    async def running_containers(self) -> list[str]:
+        return (await self._run("docker", "ps", "--format", "{{.Names}}")).split()
 
     # ---------- низкоуровневое ----------
 
@@ -115,12 +109,69 @@ class AwgServer:
             stdin=content.encode(),
         )
 
+    # ---------- clientsTable (список пользователей в приложении Amnezia) ----------
+
+    clients_table_path = CLIENTS_TABLE
+
+    async def _load_clients_table(self) -> list:
+        try:
+            raw = await self.read_file(self.clients_table_path)
+        except AwgError:
+            return []
+        try:
+            data = json.loads(raw) if raw.strip() else []
+        except json.JSONDecodeError:
+            log.warning("clientsTable повреждён, будет перезаписан")
+            return []
+        if isinstance(data, dict):  # старый формат {clientId: {clientName}}
+            data = [
+                {"clientId": cid, "userData": {"clientName": (v or {}).get("clientName", "")}}
+                for cid, v in data.items()
+            ]
+        return data if isinstance(data, list) else []
+
+    async def _save_clients_table(self, table: list) -> None:
+        await self.write_file(self.clients_table_path, json.dumps(table, ensure_ascii=False, indent=4) + "\n")
+
+    async def _table_add(self, client_id: str, client_name: str) -> None:
+        try:
+            table = [c for c in await self._load_clients_table() if c.get("clientId") != client_id]
+            table.append({"clientId": client_id, "userData": {"clientName": client_name, "creationDate": qt_date_now()}})
+            await self._save_clients_table(table)
+        except AwgError:
+            log.exception("Не удалось обновить clientsTable (ключ при этом выдан)")
+
+    async def _table_remove(self, client_id: str) -> None:
+        try:
+            table = await self._load_clients_table()
+            new_table = [c for c in table if c.get("clientId") != client_id]
+            if len(new_table) != len(table):
+                await self._save_clients_table(new_table)
+        except AwgError:
+            log.exception("Не удалось обновить clientsTable")
+
+
+class AwgServer(ContainerClient):
+    def __init__(
+        self,
+        container: str | None = None,
+        config_path: str | None = None,
+        interface: str | None = None,
+        binary: str | None = None,
+        docker: str = "docker",
+        runner: Runner | None = None,
+    ) -> None:
+        super().__init__(container, docker, runner)
+        self._config_path = config_path
+        self._interface = interface
+        self._binary = binary
+
     # ---------- настройка ----------
 
     async def detect(self) -> None:
         """Определяет контейнер AWG, если он не задан явно."""
         if not self.container:
-            names = (await self._run("docker", "ps", "--format", "{{.Names}}")).split()
+            names = await self.running_containers()
             for candidate in KNOWN_CONTAINERS:
                 if candidate in names:
                     self.container = candidate
@@ -247,28 +298,6 @@ class AwgServer:
         b, i = self._binary, self._interface
         await self._exec(f"{b} syncconf {i} <({b}-quick strip {shlex.quote(self.config_path)})")
 
-    # ---------- clientsTable (список пользователей в приложении Amnezia) ----------
-
-    async def _load_clients_table(self) -> list:
-        try:
-            raw = await self.read_file(CLIENTS_TABLE)
-        except AwgError:
-            return []
-        try:
-            data = json.loads(raw) if raw.strip() else []
-        except json.JSONDecodeError:
-            log.warning("clientsTable повреждён, будет перезаписан")
-            return []
-        if isinstance(data, dict):  # старый формат {clientId: {clientName}}
-            data = [
-                {"clientId": cid, "userData": {"clientName": (v or {}).get("clientName", "")}}
-                for cid, v in data.items()
-            ]
-        return data if isinstance(data, list) else []
-
-    async def _save_clients_table(self, table: list) -> None:
-        await self.write_file(CLIENTS_TABLE, json.dumps(table, ensure_ascii=False, indent=4) + "\n")
-
     # ---------- публичное API ----------
 
     async def add_peer(
@@ -293,19 +322,7 @@ class AwgServer:
             cfg.add_peer(public_key, info.preshared_key, f"{ip}/32")
             await self.write_file(self.config_path, cfg.dump())
             await self.apply()
-
-            try:
-                table = await self._load_clients_table()
-                table.append(
-                    {
-                        "clientId": public_key,
-                        "userData": {"clientName": client_name, "creationDate": qt_date_now()},
-                    }
-                )
-                await self._save_clients_table(table)
-            except AwgError:
-                log.exception("Не удалось обновить clientsTable (ключ при этом выдан)")
-
+            await self._table_add(public_key, client_name)
             return NewPeer(private_key, public_key, ip), info
 
     async def remove_peer(self, public_key: str) -> bool:
@@ -315,13 +332,7 @@ class AwgServer:
             if removed:
                 await self.write_file(self.config_path, cfg.dump())
                 await self.apply()
-            try:
-                table = await self._load_clients_table()
-                new_table = [c for c in table if c.get("clientId") != public_key]
-                if len(new_table) != len(table):
-                    await self._save_clients_table(new_table)
-            except AwgError:
-                log.exception("Не удалось обновить clientsTable")
+            await self._table_remove(public_key)
             return removed
 
     async def stats(self) -> dict[str, PeerStats]:

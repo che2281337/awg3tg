@@ -1,4 +1,4 @@
-"""Демо-режим (AWG_MOCK=1): эмуляция контейнера amnezia-awg2 в локальной папке.
+"""Демо-режим (AWG_MOCK=1): эмуляция контейнеров amnezia-awg2 и amnezia-xray в локальной папке.
 
 Нужен, чтобы попробовать бота на своём компьютере без VPN-сервера и Docker:
 выдача ключей, подписки, оплаты, админка и статистика работают как настоящие,
@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -15,6 +16,7 @@ import time
 
 from .keys import generate_keypair
 from .server import AWG_DIR, KNOWN_CONTAINERS, AwgError, AwgServer, PeerStats
+from .xray import PUBLIC_KEY, SERVER_CONFIG, XRAY_CONTAINER, XrayServer, XrayStats, ensure_stats_api
 
 log = logging.getLogger(__name__)
 
@@ -114,4 +116,74 @@ class MockAwgServer(AwgServer):
                 st.rx += random.randint(1, 30) * 1024 * 1024
                 st.tx += random.randint(10, 300) * 1024 * 1024
             result[pub] = PeerStats(st.latest_handshake, st.rx, st.tx)
+        return result
+
+
+def _sample_xray_config() -> dict:
+    from .keys import generate_keypair as _kp
+
+    priv, _ = _kp()
+    return {
+        "log": {"loglevel": "error"},
+        "inbounds": [
+            {
+                "port": 443,
+                "protocol": "vless",
+                "settings": {"clients": [], "decryption": "none"},
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "dest": "www.googletagmanager.com:443",
+                        "fingerprint": "chrome",
+                        "privateKey": priv.replace("+", "-").replace("/", "_").rstrip("="),
+                        "serverNames": ["www.googletagmanager.com"],
+                        "shortIds": ["%016x" % random.getrandbits(64)],
+                    },
+                },
+            }
+        ],
+        "outbounds": [{"protocol": "freedom"}],
+    }
+
+
+class MockXrayServer(XrayServer):
+    """Эмуляция контейнера amnezia-xray (VLESS + Reality) в папке демо-сервера."""
+
+    def __init__(self, root: str) -> None:
+        super().__init__(container=XRAY_CONTAINER)
+        self.root = os.path.abspath(root)
+        self._counters: dict[str, XrayStats] = {}
+
+    _local = MockAwgServer._local
+    _check_up = MockAwgServer._check_up
+    read_file = MockAwgServer.read_file
+    write_file = MockAwgServer.write_file
+
+    async def detect(self) -> None:
+        self._check_up()
+        conf = self._local(SERVER_CONFIG)
+        if not os.path.exists(conf):
+            os.makedirs(os.path.dirname(conf), exist_ok=True)
+            _, pub = generate_keypair()
+            with open(conf, "w", encoding="utf-8") as f:
+                json.dump(_sample_xray_config(), f, indent=4)
+            with open(self._local(PUBLIC_KEY), "w") as f:
+                f.write(pub.replace("+", "-").replace("/", "_").rstrip("=") + "\n")
+
+    async def _save(self, cfg: dict) -> None:
+        ensure_stats_api(cfg)
+        await self.write_file(SERVER_CONFIG, json.dumps(cfg, ensure_ascii=False, indent=4) + "\n")
+
+    async def restart(self) -> None:
+        pass
+
+    async def stats(self) -> dict[str, XrayStats]:
+        result = {}
+        for cid in self.client_ids(await self.load_config()):
+            st = self._counters.setdefault(cid, XrayStats(0, 0))
+            if random.random() < 0.5:
+                st.rx += random.randint(1, 20) * 1024 * 1024
+                st.tx += random.randint(10, 200) * 1024 * 1024
+            result[cid] = XrayStats(st.rx, st.tx)
         return result
