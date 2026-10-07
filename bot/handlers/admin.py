@@ -186,7 +186,7 @@ async def user_card(db: Database, service: VpnService, uid: int):
         f"Регистрация: {fmt_dt(u.created_at)}, был в боте: {fmt_dt(u.last_seen)}\n"
         f"Подписка: {sub}\n"
         f"Устройства: {len(keys)} из {service.device_limit(u)} (онлайн {online})\n"
-        f"Пробный период: {'использован' if u.trial_used else 'не использован'}\n"
+        f"Скидка новичка: {'использована' if paid else 'доступна'}\n"
         f"Оплат: {len(paid)} на {sum(p.amount for p in paid)} {service.settings.currency}\n"
         f"Рефералов: {refs_total} (оплатили {refs_paid})"
         + (f", пригласил: {esc(referrer.title)}" if referrer else "")

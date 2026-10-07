@@ -14,7 +14,7 @@ import segno
 from .awg.export import ClientParams, build_native_config, build_vpn_url
 from .awg.server import AwgServer, ServerInfo
 from .config import Settings
-from .db import Database, Key, Payment, User, now
+from .db import Database, Key, Payment, Plan, User, now
 from .utils import today
 
 log = logging.getLogger(__name__)
@@ -228,22 +228,25 @@ class VpnService:
         await self.db.update_user(tg_id, device_limit=max(0, min(limit, MAX_DEVICES)))
         await self.sync_user(tg_id)
 
-    def trial_available(self, user: User) -> bool:
-        return (
-            self.settings.trial_days > 0
-            and not user.trial_used
-            and not user.active
-            and not self.is_admin(user.tg_id)
-        )
+    async def is_newbie(self, user: User) -> bool:
+        """Новичок — ни разу не оплачивал подписку."""
+        return not self.is_admin(user.tg_id) and not await self.db.has_paid(user.tg_id)
 
-    async def start_trial(self, user: User) -> User:
-        user = await self.db.get_user(user.tg_id) or user
-        if not self.trial_available(user):
-            raise ServiceError("Пробный период уже использован.")
-        await self.db.update_user(user.tg_id, trial_used=1)
-        return await self.extend(
-            user.tg_id, self.settings.trial_days, devices=max(user.device_limit, self.settings.trial_devices)
-        )
+    async def price_for(self, user: User, plan: Plan) -> int:
+        """Цена тарифа для пользователя: новичкам скидка на первую оплату
+        (только для тарифов не длиннее FIRST_DISCOUNT_MAX_DAYS)."""
+        pct = self.settings.first_discount_percent
+        if pct <= 0 or plan.days > self.settings.first_discount_max_days or not await self.is_newbie(user):
+            return plan.price
+        return max(0, plan.price * (100 - min(pct, 100)) // 100)
+
+    async def first_offer(self, user: User) -> tuple[Plan, int] | None:
+        """Самый короткий тариф со скидкой новичка — для приветствия."""
+        for plan in await self.db.plans():
+            price = await self.price_for(user, plan)
+            if price < plan.price:
+                return plan, price
+        return None
 
     # ---------- оплата ----------
 

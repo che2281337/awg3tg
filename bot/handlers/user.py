@@ -19,13 +19,11 @@ from .keyboards import (
     BTN_PLANS,
     BTN_PROFILE,
     BTN_REF,
-    DEVICE_TYPES,
     MENU_TEXTS,
     AU,
     APay,
     Buy,
     Dev,
-    DevType,
     Menu,
     back,
     ikb,
@@ -84,11 +82,13 @@ async def cmd_start(
         "• «👤 Профиль» — срок подписки и статистика трафика"
     )
     await message.answer(text, reply_markup=main_menu(is_admin))
-    if service.trial_available(user):
+    offer = await service.first_offer(user)
+    if offer:
+        plan, price = offer
         await message.answer(
-            f"🎁 Попробуйте бесплатно: {days_word(service.settings.trial_days)}, "
-            f"{devices_word(service.settings.trial_devices)}.",
-            reply_markup=ikb([[("🎁 Активировать пробный период", Menu(action="trial").pack())]]),
+            f"🔥 Для новых пользователей — <b>{esc(plan.title)} за {price} {service.settings.currency}</b> "
+            f"вместо {plan.price} {service.settings.currency}!",
+            reply_markup=ikb([[("💳 Оформить со скидкой", Buy(action="plan", plan_id=plan.id).pack())]]),
         )
 
 
@@ -117,8 +117,6 @@ async def profile_view(db: Database, service: VpnService, user: User) -> tuple[s
         f"Всего: {human_bytes(t_all.tx)} / {human_bytes(t_all.rx)}"
     )
     rows = [[("💳 Продлить подписку" if user.active else "💳 Оформить подписку", Menu(action="plans").pack())]]
-    if service.trial_available(user):
-        rows.append([("🎁 Пробный период", Menu(action="trial").pack())])
     rows.append([("🔑 Мои устройства", Menu(action="devices").pack())])
     return text, ikb(rows)
 
@@ -136,22 +134,6 @@ async def cb_profile(call: CallbackQuery, db: Database, service: VpnService, use
     await call.answer()
     text, kb = await profile_view(db, service, user)
     await edit_or_send(call, text, kb)
-
-
-@router.callback_query(Menu.filter(F.action == "trial"))
-async def cb_trial(call: CallbackQuery, service: VpnService, user: User, is_admin: bool) -> None:
-    try:
-        user = await service.start_trial(user)
-    except ServiceError as e:
-        await call.answer(str(e), show_alert=True)
-        return
-    await call.answer("Пробный период активирован!")
-    await edit_or_send(
-        call,
-        f"🎁 Пробный период активирован до <b>{fmt_dt(user.sub_until)}</b>.\n\n"
-        "Теперь добавьте устройство — придёт ключ для подключения.",
-        ikb([[("➕ Добавить устройство", Menu(action="add").pack())]]),
-    )
 
 
 @router.message(Command("help"))
@@ -204,14 +186,15 @@ async def msg_devices(message: Message, state: FSMContext, db: Database, service
 
 
 @router.callback_query(Menu.filter(F.action == "devices"))
-async def cb_devices(call: CallbackQuery, db: Database, service: VpnService, user: User) -> None:
+async def cb_devices(call: CallbackQuery, state: FSMContext, db: Database, service: VpnService, user: User) -> None:
+    await state.clear()
     await call.answer()
     text, kb = await devices_view(db, service, user)
     await edit_or_send(call, text, kb)
 
 
 @router.callback_query(Menu.filter(F.action == "add"))
-async def cb_add_device(call: CallbackQuery, db: Database, service: VpnService, user: User) -> None:
+async def cb_add_device(call: CallbackQuery, state: FSMContext, db: Database, service: VpnService, user: User) -> None:
     if not service.has_access(user):
         await call.answer("Нет активной подписки", show_alert=True)
         return
@@ -219,10 +202,12 @@ async def cb_add_device(call: CallbackQuery, db: Database, service: VpnService, 
         await call.answer("Достигнут лимит устройств вашего тарифа", show_alert=True)
         return
     await call.answer()
-    rows = [[(title, DevType(kind=kind).pack())] for kind, title in DEVICE_TYPES.items()]
-    rows.append([("✏️ Своё название", DevType(kind="custom").pack())])
-    rows.append([back(Menu(action="devices"))])
-    await edit_or_send(call, "Какое устройство подключаем?", ikb(rows))
+    await state.set_state(UserStates.device_name)
+    await edit_or_send(
+        call,
+        "Введите название устройства, например «Мой айфон» или «Ноутбук».\nОтмена — /cancel",
+        ikb([[back(Menu(action="devices"), "Отмена")]]),
+    )
 
 
 async def _create_and_send(bot: Bot, chat_id: int, db: Database, service: VpnService, user: User, name: str) -> None:
@@ -248,19 +233,6 @@ async def _create_and_send(bot: Bot, chat_id: int, db: Database, service: VpnSer
         "Готово! Ключ всегда можно получить повторно в «🔑 Мои устройства».",
         reply_markup=ikb([[("🔑 Мои устройства", Menu(action="devices").pack())]]),
     )
-
-
-@router.callback_query(DevType.filter())
-async def cb_device_type(
-    call: CallbackQuery, callback_data: DevType, bot: Bot, state: FSMContext, db: Database, service: VpnService, user: User
-) -> None:
-    await call.answer()
-    if callback_data.kind == "custom":
-        await state.set_state(UserStates.device_name)
-        await edit_or_send(call, "Введите название устройства (например, «Ноутбук мамы»):")
-        return
-    await call.message.delete()
-    await _create_and_send(bot, call.from_user.id, db, service, user, DEVICE_TYPES.get(callback_data.kind, "Устройство"))
 
 
 @router.message(UserStates.device_name, F.text, ~F.text.in_(MENU_TEXTS), ~F.text.startswith("/"))
@@ -388,12 +360,18 @@ async def plans_view(db: Database, service: VpnService, user: User) -> tuple[str
     else:
         head = ""
     text = head + "💳 <b>Выберите тариф:</b>"
-    rows = [
-        [(f"{p.title} · {devices_word(p.devices)} · {p.price} {cur}", Buy(action="plan", plan_id=p.id).pack())]
-        for p in plans
-    ]
-    if service.trial_available(user):
-        rows.append([("🎁 Бесплатный пробный период", Menu(action="trial").pack())])
+    rows = []
+    discounted = False
+    for p in plans:
+        price = await service.price_for(user, p)
+        if price < p.price:
+            discounted = True
+            label = f"🔥 {p.title} · {devices_word(p.devices)} · {price} {cur} (вместо {p.price})"
+        else:
+            label = f"{p.title} · {devices_word(p.devices)} · {p.price} {cur}"
+        rows.append([(label, Buy(action="plan", plan_id=p.id).pack())])
+    if discounted:
+        text += "\n\n🔥 Скидка для новых пользователей на первую оплату."
     if not plans:
         text = "Тарифы пока не настроены. Напишите администратору."
     return text, ikb(rows)
@@ -415,17 +393,19 @@ async def cb_plans(call: CallbackQuery, db: Database, service: VpnService, user:
 
 
 @router.callback_query(Buy.filter(F.action == "plan"))
-async def cb_buy_plan(call: CallbackQuery, callback_data: Buy, db: Database, service: VpnService) -> None:
+async def cb_buy_plan(call: CallbackQuery, callback_data: Buy, db: Database, service: VpnService, user: User) -> None:
     plan = await db.get_plan(callback_data.plan_id)
     if plan is None or not plan.active:
         await call.answer("Тариф недоступен", show_alert=True)
         return
     await call.answer()
     s = service.settings
+    price = await service.price_for(user, plan)
+    note = f" <s>{plan.price} {s.currency}</s> — скидка новичка" if price < plan.price else ""
     text = (
         f"<b>{esc(plan.title)}</b>\n"
         f"Срок: {days_word(plan.days)}, {devices_word(plan.devices)}\n"
-        f"К оплате: <b>{plan.price} {s.currency}</b>\n\n"
+        f"К оплате: <b>{price} {s.currency}</b>{note}\n\n"
         f"{s.payment_details}\n\n"
         "После оплаты нажмите «✅ Я оплатил» и отправьте скриншот или чек."
     )
@@ -480,7 +460,10 @@ async def st_receipt(
         rtype, receipt = "document", message.document.file_id
     else:
         rtype, receipt = "text", (message.text or "")[:1000]
-    payment = await db.create_payment(user.tg_id, plan, rtype, receipt)
+    # Цена считается заново на сервере — скидку нельзя «принести» из старой кнопки.
+    price = await service.price_for(user, plan)
+    title = plan.title + (" (скидка новичка)" if price < plan.price else "")
+    payment = await db.create_payment(user.tg_id, plan, rtype, receipt, amount=price, title=title)
     await message.answer(
         f"✅ Заявка на оплату №{payment.id} отправлена. Подписка активируется после проверки администратором — "
         "обычно это занимает немного времени. Я пришлю уведомление."

@@ -92,7 +92,8 @@ def left_str(until: int | None, now_ts: int) -> str:
     if not until or until <= now_ts:
         return "истекла"
     sec = until - now_ts
-    d, h = sec // 86400, (sec % 86400) // 3600
+    # Округляем до ближайшего дня: сразу после покупки на 30 дней показываем «30», а не «29».
+    d, h = (sec + 43200) // 86400 if sec >= 86400 else 0, sec // 3600
     if d:
         return f"осталось {days_word(d)}"
     if h:

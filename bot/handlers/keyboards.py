@@ -11,29 +11,18 @@ BTN_HELP = "❓ Помощь"
 BTN_ADMIN = "🛠 Админка"
 MENU_TEXTS = (BTN_PROFILE, BTN_DEVICES, BTN_PLANS, BTN_REF, BTN_HELP, BTN_ADMIN)
 
-DEVICE_TYPES = {
-    "phone": "📱 Телефон",
-    "pc": "💻 Компьютер",
-    "tablet": "📟 Планшет",
-    "tv": "📺 Телевизор",
-    "router": "📡 Роутер",
-}
 
 
 # ---------- callback data ----------
 
 
 class Menu(CallbackData, prefix="m"):
-    action: str  # profile | devices | plans | ref | trial | add | help
+    action: str  # profile | devices | plans | ref | add | help
 
 
 class Dev(CallbackData, prefix="d"):
     action: str  # view | key | ren | del | delok
     id: int
-
-
-class DevType(CallbackData, prefix="dt"):
-    kind: str
 
 
 class Buy(CallbackData, prefix="buy"):

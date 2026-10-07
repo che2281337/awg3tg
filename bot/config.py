@@ -37,8 +37,10 @@ class Settings:
     currency: str = "₽"
     payment_details: str = "Реквизиты для оплаты не заданы — напишите администратору."
     support: str = ""
-    trial_days: int = 3
-    trial_devices: int = 1
+    # Скидка новичкам на первую оплату (в процентах) и максимальный срок тарифа,
+    # на который она действует: 31 — только месячный тариф.
+    first_discount_percent: int = 50
+    first_discount_max_days: int = 31
     ref_bonus_days: int = 7
     # Сколько устройств можно добавить без тарифа (админ может выставить вручную).
     default_devices: int = 1
@@ -74,8 +76,8 @@ class Settings:
             currency=os.getenv("CURRENCY", "₽").strip() or "₽",
             payment_details=details or cls.payment_details,
             support=os.getenv("SUPPORT", "").strip(),
-            trial_days=_int("TRIAL_DAYS", 3),
-            trial_devices=_int("TRIAL_DEVICES", 1),
+            first_discount_percent=max(0, min(100, _int("FIRST_DISCOUNT_PERCENT", 50))),
+            first_discount_max_days=_int("FIRST_DISCOUNT_MAX_DAYS", 31),
             ref_bonus_days=_int("REF_BONUS_DAYS", 7),
             default_devices=_int("DEFAULT_DEVICES", 1),
             stats_interval=max(60, _int("STATS_INTERVAL", 300)),

@@ -79,10 +79,9 @@ CREATE INDEX IF NOT EXISTS payments_status ON payments(status);
 """
 
 DEFAULT_PLANS = [
-    ("1 месяц", 30, 2, 150),
-    ("3 месяца", 90, 3, 400),
-    ("6 месяцев", 180, 3, 750),
-    ("12 месяцев", 365, 5, 1400),
+    ("1 месяц", 30, 2, 100),
+    ("3 месяца", 90, 2, 300),
+    ("12 месяцев", 365, 2, 1200),
 ]
 
 # Колонки, появившиеся после первой версии бота (миграция старой базы).
@@ -465,11 +464,23 @@ class Database:
 
     # ---------- payments ----------
 
-    async def create_payment(self, tg_id: int, plan: Plan, receipt_type: str, receipt: str) -> Payment:
+    async def create_payment(
+        self, tg_id: int, plan: Plan, receipt_type: str, receipt: str, *, amount: int | None = None, title: str | None = None
+    ) -> Payment:
         cur = await self.c.execute(
             """INSERT INTO payments (tg_id, plan_id, title, days, devices, amount, receipt_type, receipt, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (tg_id, plan.id, plan.title, plan.days, plan.devices, plan.price, receipt_type, receipt, now()),
+            (
+                tg_id,
+                plan.id,
+                title or plan.title,
+                plan.days,
+                plan.devices,
+                plan.price if amount is None else amount,
+                receipt_type,
+                receipt,
+                now(),
+            ),
         )
         await self.c.commit()
         p = await self.get_payment(cur.lastrowid)

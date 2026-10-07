@@ -18,7 +18,7 @@ ADMIN = 1
 async def svc(fake_container, tmp_path):
     settings = Settings(
         bot_token="x", admin_ids={ADMIN}, server_host="203.0.113.10", db_path=str(tmp_path / "bot.db"),
-        trial_days=3, trial_devices=1, ref_bonus_days=7,
+        ref_bonus_days=7,
     )
     db = Database(settings.db_path)
     await db.connect()
@@ -34,7 +34,7 @@ def server_conf(root) -> str:
 
 async def test_default_plans_seeded(svc):
     plans = await svc.db.plans()
-    assert len(plans) == 4 and plans[0].days == 30
+    assert [(p.days, p.devices, p.price) for p in plans] == [(30, 2, 100), (90, 2, 300), (365, 2, 1200)]
 
 
 async def test_no_subscription_no_device(svc):
@@ -44,26 +44,44 @@ async def test_no_subscription_no_device(svc):
         await svc.create_device(user, "📱 Телефон")
 
 
-async def test_trial_and_devices(svc, fake_container):
+async def test_device_limit_and_key(svc, fake_container):
     user, _ = await svc.db.touch_user(10, "u10", "User")
-    assert svc.trial_available(user)
-    user = await svc.start_trial(user)
-    assert user.active and user.trial_used and user.device_limit == 1
-    assert not svc.trial_available(user)
-    with pytest.raises(ServiceError):
-        await svc.start_trial(user)
-
-    rk = await svc.create_device(user, "📱 Телефон")
+    await svc.extend(10, 30, devices=1)
+    rk = await svc.create_device(user, "Мой айфон")
     assert rk.key.ip == "10.8.1.2"
     assert rk.filename == "AmneziaWG_1.conf"
     assert rk.key.public_key in server_conf(fake_container)
     data = decode_vpn_url(rk.vpn_url)
     assert json.loads(data["containers"][0]["awg"]["last_config"])["server_pub_key"] == SERVER_PUB
     table = json.loads((fake_container / "opt/amnezia/awg/clientsTable").read_text())
-    assert table[0]["userData"]["clientName"] == "📱 Телефон | @u10"
+    assert table[0]["userData"]["clientName"] == "Мой айфон | @u10"
 
     with pytest.raises(ServiceError, match="лимит"):
-        await svc.create_device(user, "💻 Компьютер")
+        await svc.create_device(user, "Ноутбук")
+
+
+async def test_newbie_discount(svc):
+    month, quarter, year = await svc.db.plans()
+    user, _ = await svc.db.touch_user(10, "new", "New")
+    assert await svc.price_for(user, month) == 50
+    assert await svc.price_for(user, quarter) == 300  # скидка только на месяц
+    assert await svc.price_for(user, year) == 1200
+    assert (await svc.first_offer(user)) == (month, 50)
+
+    # админ выдал подписку вручную — человек всё ещё новичок (он не платил)
+    await svc.extend(10, 10)
+    assert await svc.price_for(user, month) == 50
+
+    p = await svc.db.create_payment(10, month, "text", "чек", amount=50, title="1 месяц (скидка новичка)")
+    await svc.confirm_payment(p.id, ADMIN)
+    assert await svc.price_for(user, month) == 100
+    assert await svc.first_offer(user) is None
+
+    admin, _ = await svc.db.touch_user(ADMIN, "admin", "Admin")
+    assert await svc.price_for(admin, month) == 100
+
+    stats = await svc.db.stats(0, 0)
+    assert stats["revenue_total"] == 50
 
 
 async def test_expiry_disables_and_renewal_restores_same_key(svc, fake_container):
@@ -118,11 +136,11 @@ async def test_payment_and_referral(svc):
     await svc.db.touch_user(10, "ref", "Referrer")
     await svc.db.touch_user(11, "friend", "Friend")
     await svc.db.update_user(11, referrer_id=10)
-    plan = (await svc.db.plans())[1]  # 3 месяца, 3 устройства
+    plan = (await svc.db.plans())[1]  # 3 месяца, 2 устройства
     friend = await svc.db.get_user(11)
     p = await svc.db.create_payment(11, plan, "text", "оплатил")
     res = await svc.confirm_payment(p.id, ADMIN)
-    assert res.user.active and res.user.device_limit == 3
+    assert res.user.active and res.user.device_limit == 2
     assert res.user.sub_until >= now() + 89 * 86400
     assert res.referrer and res.referrer.tg_id == 10
     assert res.referrer.sub_until >= now() + 6 * 86400
