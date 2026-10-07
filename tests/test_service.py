@@ -34,7 +34,7 @@ def server_conf(root) -> str:
 
 async def test_default_plans_seeded(svc):
     plans = await svc.db.plans()
-    assert [(p.days, p.devices, p.price) for p in plans] == [(30, 2, 100), (90, 2, 300), (365, 2, 1200)]
+    assert [(p.days, p.devices, p.price) for p in plans] == [(30, 2, 100), (90, 2, 300), (180, 2, 600), (365, 2, 1200)]
 
 
 async def test_no_subscription_no_device(svc):
@@ -61,10 +61,11 @@ async def test_device_limit_and_key(svc, fake_container):
 
 
 async def test_newbie_discount(svc):
-    month, quarter, year = await svc.db.plans()
+    month, quarter, half, year = await svc.db.plans()
     user, _ = await svc.db.touch_user(10, "new", "New")
     assert await svc.price_for(user, month) == 50
     assert await svc.price_for(user, quarter) == 300  # скидка только на месяц
+    assert await svc.price_for(user, half) == 600
     assert await svc.price_for(user, year) == 1200
     assert (await svc.first_offer(user)) == (month, 50)
 

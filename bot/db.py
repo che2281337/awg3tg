@@ -81,6 +81,7 @@ CREATE INDEX IF NOT EXISTS payments_status ON payments(status);
 DEFAULT_PLANS = [
     ("1 месяц", 30, 2, 100),
     ("3 месяца", 90, 2, 300),
+    ("6 месяцев", 180, 2, 600),
     ("12 месяцев", 365, 2, 1200),
 ]
 
