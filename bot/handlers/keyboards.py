@@ -54,6 +54,22 @@ class Buy(CallbackData, prefix="buy"):
     sid: int = 0  # сервер, выбранный при покупке
 
 
+class SlotCb(CallbackData, prefix="sl"):
+    """Доп. слот устройства: buy — купить новый, renew — продлить слот id, paid — «Я оплатил»."""
+
+    action: str
+    id: int = 0
+
+
+class ASlot(CallbackData, prefix="asl"):
+    """Админ: доп. слоты пользователя uid (list | add | ext | del)."""
+
+    action: str
+    uid: int
+    id: int = 0
+    arg: int = 0
+
+
 class DevProto(CallbackData, prefix="dp"):
     """Выбор протокола для нового устройства на сервере sid."""
 
@@ -128,6 +144,10 @@ def ikb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows if row]
     )
+
+
+def slot_kb(slot_id: int, price: int, currency: str) -> InlineKeyboardMarkup:
+    return ikb([[(f"🔁 Продлить слот — {price} {currency}", SlotCb(action="renew", id=slot_id).pack())]])
 
 
 def renew_kb() -> InlineKeyboardMarkup:

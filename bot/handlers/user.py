@@ -11,7 +11,18 @@ from aiogram.types import CallbackQuery, Message
 from ..awg.server import AwgError
 from ..db import PROTOCOLS, Database, User, now
 from ..service import ServiceError, VpnService
-from ..utils import days_word, devices_word, esc, fmt_date, fmt_dt, human_bytes, left_str, month_start_day, today
+from ..utils import (
+    days_word,
+    devices_word,
+    esc,
+    fmt_date,
+    fmt_dt,
+    human_bytes,
+    left_str,
+    month_start_day,
+    plural,
+    today,
+)
 from .common import deliver_key, edit_or_send, help_text, notify_admins
 from .keyboards import (
     BTN_DEVICES,
@@ -24,6 +35,7 @@ from .keyboards import (
     APay,
     PROTO_BUTTONS,
     PROTO_ICONS,
+    SlotCb,
     Buy,
     Dev,
     DevProto,
@@ -96,9 +108,18 @@ async def cmd_start(
         )
 
 
+async def slots_line(db: Database, service: VpnService, user: User) -> str:
+    """«2 по тарифу + 1 доп. слот (до 07.11)» — если есть доп. слоты."""
+    slots = await db.user_slots(user.tg_id, active_only=True)
+    if not slots or service.is_admin(user.tg_id):
+        return ""
+    dates = ", ".join(fmt_date(s.until) for s in slots)
+    return f" ({service.base_limit(user)} по тарифу + {plural(len(slots), 'доп. слот', 'доп. слота', 'доп. слотов')} до {dates})"
+
+
 async def profile_view(db: Database, service: VpnService, user: User) -> tuple[str, object]:
     keys = await db.user_keys(user.tg_id)
-    limit = service.device_limit(user)
+    limit = await service.device_limit(user)
     t_today = await db.traffic(tg_id=user.tg_id, since=today())
     t_month = await db.traffic(tg_id=user.tg_id, since=month_start_day())
     t_all = await db.traffic(tg_id=user.tg_id)
@@ -116,7 +137,7 @@ async def profile_view(db: Database, service: VpnService, user: User) -> tuple[s
         f"ID: <code>{user.tg_id}</code>\n"
         f"Подписка: {sub}\n"
         f"Сервер: {esc(home.title) if home else 'не выбран'}\n"
-        f"Устройства: {len(keys)} из {limit}\n\n"
+        f"Устройства: {len(keys)} из {limit}{await slots_line(db, service, user)}\n\n"
         f"📊 <b>Трафик</b> (скачано / отдано)\n"
         f"Сегодня: {human_bytes(t_today.tx)} / {human_bytes(t_today.rx)}\n"
         f"За месяц: {human_bytes(t_month.tx)} / {human_bytes(t_month.rx)}\n"
@@ -186,8 +207,8 @@ async def cb_help(call: CallbackQuery, service: VpnService) -> None:
 
 async def devices_view(db: Database, service: VpnService, user: User) -> tuple[str, object]:
     keys = await db.user_keys(user.tg_id)
-    limit = service.device_limit(user)
-    lines = [f"🔑 <b>Мои устройства</b> ({len(keys)} из {limit})\n"]
+    limit = await service.device_limit(user)
+    lines = [f"🔑 <b>Мои устройства</b> ({len(keys)} из {limit}){await slots_line(db, service, user)}\n"]
     if not service.has_access(user):
         lines.append("⛔ Подписка не активна — устройства отключены.\n")
     online_border = now() - 180
@@ -208,7 +229,12 @@ async def devices_view(db: Database, service: VpnService, user: User) -> tuple[s
     ]
     if service.has_access(user) and len(keys) < limit:
         rows.append([("➕ Добавить устройство", Menu(action="add").pack())])
-    elif not service.has_access(user):
+    elif service.has_access(user):
+        s = service.settings
+        rows.append(
+            [(f"➕ Ещё устройство — {s.slot_price} {s.currency} / {s.slot_days} дн.", SlotCb(action="buy").pack())]
+        )
+    else:
         rows.append([("💳 Оформить подписку", Menu(action="plans").pack())])
     return "\n".join(lines), ikb(rows)
 
@@ -234,8 +260,8 @@ async def cb_add_device(call: CallbackQuery, state: FSMContext, db: Database, se
     if not service.has_access(user):
         await call.answer("Нет активной подписки", show_alert=True)
         return
-    if len(await db.user_keys(user.tg_id)) >= service.device_limit(user):
-        await call.answer("Достигнут лимит устройств вашего тарифа", show_alert=True)
+    if len(await db.user_keys(user.tg_id)) >= await service.device_limit(user):
+        await cb_slot_offer(call, SlotCb(action="buy"), service, user)
         return
     servers = await service.available_servers()
     if not servers:
@@ -619,6 +645,62 @@ async def cb_buy_server(call: CallbackQuery, callback_data: Buy, db: Database, s
     )
 
 
+# ---------- доп. слоты устройств ----------
+
+
+@router.callback_query(SlotCb.filter(F.action.in_({"buy", "renew"})))
+async def cb_slot_offer(call: CallbackQuery, callback_data: SlotCb, service: VpnService, user: User) -> None:
+    """Покупка ещё одного устройства сверх тарифа (или продление слота)."""
+    s = service.settings
+    if not service.has_access(user):
+        await call.answer("Сначала оформите или продлите подписку в «💳 Тарифы»", show_alert=True)
+        return
+    slot = None
+    if callback_data.action == "renew":
+        slot = await service.db.get_slot(callback_data.id)
+        if slot is None or slot.tg_id != user.tg_id:
+            await call.answer("Слот не найден", show_alert=True)
+            return
+    await call.answer()
+    if slot:
+        head = (
+            f"🔁 <b>Продление доп. слота устройства</b>\n\n"
+            f"Сейчас действует до {fmt_dt(slot.until)}, продление добавит {days_word(s.slot_days)}.\n"
+        )
+    else:
+        limit = await service.device_limit(user)
+        head = (
+            f"➕ <b>Ещё одно устройство</b>\n\n"
+            f"Сейчас доступно {devices_word(limit)}. Дополнительный слот добавит ещё одно устройство "
+            f"на {days_word(s.slot_days)} (подписка при этом не меняется).\n"
+        )
+    text = (
+        head
+        + f"К оплате: <b>{s.slot_price} {s.currency}</b>\n\n"
+        f"{s.payment_details}\n\n"
+        "После оплаты нажмите «✅ Я оплатил» и отправьте скриншот или чек."
+    )
+    await edit_or_send(
+        call,
+        text,
+        ikb([[("✅ Я оплатил", SlotCb(action="paid", id=slot.id if slot else 0).pack())], [back(Menu(action="devices"))]]),
+    )
+
+
+@router.callback_query(SlotCb.filter(F.action == "paid"))
+async def cb_slot_paid(call: CallbackQuery, callback_data: SlotCb, state: FSMContext, db: Database, user: User) -> None:
+    if await db.pending_count(user.tg_id) >= MAX_PENDING_PAYMENTS:
+        await call.answer("У вас уже есть заявки на проверке. Дождитесь решения администратора.", show_alert=True)
+        return
+    await call.answer()
+    await state.set_state(UserStates.receipt)
+    await state.update_data(kind="slot", slot_id=callback_data.id or None)
+    await call.message.answer(
+        "📎 Отправьте скриншот или чек об оплате (фото, файл или текстом).\n"
+        "Чтобы отменить — /cancel"
+    )
+
+
 @router.callback_query(Buy.filter(F.action == "paid"))
 async def cb_buy_paid(call: CallbackQuery, callback_data: Buy, state: FSMContext, db: Database, user: User) -> None:
     plan = await db.get_plan(callback_data.plan_id)
@@ -648,8 +730,17 @@ async def st_receipt(
     message: Message, bot: Bot, state: FSMContext, db: Database, service: VpnService, user: User
 ) -> None:
     data = await state.get_data()
-    plan = await db.get_plan(data.get("plan_id", 0))
     await state.clear()
+    if message.photo:
+        rtype, receipt = "photo", message.photo[-1].file_id
+    elif message.document:
+        rtype, receipt = "document", message.document.file_id
+    else:
+        rtype, receipt = "text", (message.text or "")[:1000]
+    if data.get("kind") == "slot":
+        await _slot_receipt(message, bot, db, service, user, data.get("slot_id"), rtype, receipt)
+        return
+    plan = await db.get_plan(data.get("plan_id", 0))
     # Проверяем ещё раз: callback_data можно подделать и подсунуть скрытый тариф.
     if plan is None or not plan.active:
         await message.answer("Тариф не найден, выберите его заново в «💳 Тарифы».")
@@ -657,12 +748,6 @@ async def st_receipt(
     if await db.pending_count(user.tg_id) >= MAX_PENDING_PAYMENTS:
         await message.answer("У вас уже есть заявки на проверке. Дождитесь решения администратора.")
         return
-    if message.photo:
-        rtype, receipt = "photo", message.photo[-1].file_id
-    elif message.document:
-        rtype, receipt = "document", message.document.file_id
-    else:
-        rtype, receipt = "text", (message.text or "")[:1000]
     # Цена считается заново на сервере — скидку нельзя «принести» из старой кнопки.
     price = await service.price_for(user, plan)
     title = plan.title + (" (скидка новичка)" if price < plan.price else "")
@@ -679,6 +764,26 @@ async def st_receipt(
     await send_payment_to_admins(bot, service, payment.id)
 
 
+async def _slot_receipt(
+    message: Message, bot: Bot, db: Database, service: VpnService, user: User, slot_id, rtype: str, receipt: str
+) -> None:
+    if await db.pending_count(user.tg_id) >= MAX_PENDING_PAYMENTS:
+        await message.answer("У вас уже есть заявки на проверке. Дождитесь решения администратора.")
+        return
+    if slot_id:
+        slot = await db.get_slot(slot_id)
+        if slot is None or slot.tg_id != user.tg_id:  # чужой или удалённый слот — покупаем новый
+            slot_id = None
+    s = service.settings
+    # Цена и срок берутся из настроек на сервере, а не из кнопки.
+    payment = await db.create_slot_payment(user.tg_id, s.slot_price, s.slot_days, rtype, receipt, slot_id)
+    await message.answer(
+        f"✅ Заявка на оплату №{payment.id} отправлена. Слот добавится после проверки администратором — "
+        "я пришлю уведомление."
+    )
+    await send_payment_to_admins(bot, service, payment.id)
+
+
 async def send_payment_to_admins(bot: Bot, service: VpnService, payment_id: int) -> None:
     db = service.db
     p = await db.get_payment(payment_id)
@@ -690,7 +795,11 @@ async def send_payment_to_admins(bot: Bot, service: VpnService, payment_id: int)
     caption = (
         f"💳 <b>Оплата №{p.id}</b>\n"
         f"От: {who} (<code>{p.tg_id}</code>)\n"
-        f"Тариф: {esc(p.title)} — {days_word(p.days)}, {devices_word(p.devices)}\n"
+        + (
+            f"Тариф: {esc(p.title)} — {days_word(p.days)}, {devices_word(p.devices)}\n"
+            if p.kind == "plan"
+            else f"Покупка: {esc(p.title)} — +1 устройство на {days_word(p.days)}\n"
+        )
         + (f"Сервер: {esc(server.title)}\n" if server else "")
         + f"Сумма: <b>{p.amount} {service.settings.currency}</b>"
     )

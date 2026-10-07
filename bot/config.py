@@ -48,6 +48,9 @@ class Settings:
     ref_bonus_days: int = 7
     # Сколько устройств можно добавить без тарифа (админ может выставить вручную).
     default_devices: int = 1
+    # Дополнительный слот устройства сверх тарифа: цена и срок действия
+    slot_price: int = 100
+    slot_days: int = 30
 
     # Фоновые задачи
     stats_interval: int = 300
@@ -88,6 +91,8 @@ class Settings:
             first_discount_max_days=_int("FIRST_DISCOUNT_MAX_DAYS", 31),
             ref_bonus_days=_int("REF_BONUS_DAYS", 7),
             default_devices=_int("DEFAULT_DEVICES", 1),
+            slot_price=max(0, _int("SLOT_PRICE", 100)),
+            slot_days=max(1, min(_int("SLOT_DAYS", 30), 3650)),
             stats_interval=max(60, _int("STATS_INTERVAL", 300)),
             backup_hours=max(0, _int("BACKUP_HOURS", 24)),
             awg_mock=os.getenv("AWG_MOCK", "").strip().lower() in ("1", "true", "yes", "on"),

@@ -397,10 +397,15 @@ class VpnService:
             return self._rendered_vless(key, row, await client.info())
         return self._rendered_awg(key, row, await client.server_info())
 
-    def device_limit(self, user: User) -> int:
+    def base_limit(self, user: User) -> int:
+        """Устройств по тарифу (без доп. слотов)."""
+        return user.device_limit or self.settings.default_devices
+
+    async def device_limit(self, user: User) -> int:
+        """Итоговый лимит: по тарифу + действующие доп. слоты."""
         if self.is_admin(user.tg_id):
             return ADMIN_DEVICE_LIMIT
-        return user.device_limit or self.settings.default_devices
+        return min(self.base_limit(user) + await self.db.active_slot_count(user.tg_id), MAX_DEVICES)
 
     def has_access(self, user: User) -> bool:
         return not user.banned and (user.active or self.is_admin(user.tg_id))
@@ -423,7 +428,7 @@ class VpnService:
                 if not self.has_access(user):
                     raise ServiceError("Нет активной подписки. Оформите её в разделе «💳 Тарифы».")
                 keys = await self.db.user_keys(user.tg_id)
-                limit = self.device_limit(user)
+                limit = await self.device_limit(user)
                 if len(keys) >= limit:
                     raise ServiceError(
                         f"Достигнут лимит устройств ({len(keys)}/{limit}). "
@@ -540,7 +545,7 @@ class VpnService:
         keys = await self.db.user_keys(tg_id)
         changed: list[Key] = []
         access = self.has_access(user)
-        limit = self.device_limit(user) if access else 0
+        limit = await self.device_limit(user) if access else 0
         for i, k in enumerate(keys):  # самые старые устройства в приоритете
             try:
                 if i < limit and not k.enabled:
@@ -610,6 +615,42 @@ class VpnService:
                 return plan, price
         return None
 
+    # ---------- доп. слоты устройств ----------
+
+    async def add_slot(self, tg_id: int, days: int, source: str = "admin"):
+        if not 0 < days <= MAX_DAYS:
+            raise ServiceError(f"Срок слота должен быть от 1 до {MAX_DAYS} дней.")
+        slot = await self.db.add_slot(tg_id, clamp_ts(now() + days * 86400), source)
+        await self.sync_user(tg_id)
+        return slot
+
+    async def extend_slot(self, slot_id: int, days: int):
+        slot = await self.db.get_slot(slot_id)
+        if slot is None:
+            raise ServiceError("Слот не найден.")
+        if not -MAX_DAYS <= days <= MAX_DAYS:
+            raise ServiceError(f"Срок должен быть от -{MAX_DAYS} до {MAX_DAYS} дней.")
+        base = max(now(), slot.until) if days > 0 else slot.until
+        await self.db.update_slot(slot.id, until=clamp_ts(base + days * 86400), notified=0)
+        await self.sync_user(slot.tg_id)
+        return await self.db.get_slot(slot.id)
+
+    async def remove_slot(self, slot_id: int) -> None:
+        slot = await self.db.get_slot(slot_id)
+        if slot is None:
+            return
+        await self.db.delete_slot(slot.id)
+        await self.sync_user(slot.tg_id)
+
+    async def expire_slots(self) -> list:
+        """Закончившиеся слоты: отключаем лишние устройства. Возвращает слоты для уведомления."""
+        expired = await self.db.slots_expired_unnotified()
+        for slot in expired:
+            await self.db.update_slot(slot.id, notified=2)
+        for tg_id in {s.tg_id for s in expired}:
+            await self.sync_user(tg_id)
+        return expired
+
     # ---------- оплата ----------
 
     async def confirm_payment(self, payment_id: int, admin_id: int) -> PaymentResult:
@@ -617,6 +658,15 @@ class VpnService:
             raise ServiceError("Платёж уже обработан.")
         payment = await self.db.get_payment(payment_id)
         assert payment
+        if payment.kind == "slot":
+            slot = await self.db.get_slot(payment.slot_id) if payment.slot_id else None
+            if slot is not None and slot.tg_id == payment.tg_id:
+                await self.extend_slot(slot.id, payment.days)  # продление того же слота
+            else:
+                await self.add_slot(payment.tg_id, payment.days, "paid")
+            user = await self.db.get_user(payment.tg_id)
+            assert user
+            return PaymentResult(payment, user)
         if payment.server_id and await self.db.get_server(payment.server_id):
             await self.set_user_server(payment.tg_id, payment.server_id)
         user = await self.extend(payment.tg_id, payment.days, devices=payment.devices)

@@ -37,6 +37,7 @@ from .keyboards import (
     AMove,
     APay,
     APlan,
+    ASlot,
     ASrv,
     Bcast,
     UList,
@@ -184,6 +185,7 @@ async def user_card(db: Database, service: VpnService, uid: int):
     if u is None:
         return "Пользователь не найден (возможно, удалён).", ikb([[back(UList(flt="all"))]])
     keys = await db.user_keys(uid)
+    slots = await db.user_slots(uid, active_only=True)
     t_today = await db.traffic(tg_id=uid, since=today())
     t_month = await db.traffic(tg_id=uid, since=month_start_day())
     t_all = await db.traffic(tg_id=uid)
@@ -203,7 +205,8 @@ async def user_card(db: Database, service: VpnService, uid: int):
         f"ID: <code>{u.tg_id}</code>{' · @' + esc(u.username) if u.username else ''}\n"
         f"Регистрация: {fmt_dt(u.created_at)}, был в боте: {fmt_dt(u.last_seen)}\n"
         f"Подписка: {sub}\n"
-        f"Устройства: {len(keys)} из {service.device_limit(u)} (онлайн {online})\n"
+        f"Устройства: {len(keys)} из {await service.device_limit(u)} (онлайн {online}; по тарифу "
+        f"{service.base_limit(u)} + доп. слотов {len(slots)})\n"
         f"Скидка новичка: {'использована' if paid else 'доступна'}\n"
         f"Оплат: {len(paid)} на {sum(p.amount for p in paid)} {service.settings.currency}\n"
         f"Рефералов: {refs_total} (оплатили {refs_paid})"
@@ -221,6 +224,7 @@ async def user_card(db: Database, service: VpnService, uid: int):
             [("📱 −1", a("dev", -1)), (f"Лимит: {u.device_limit or service.settings.default_devices}", a("card")), ("📱 +1", a("dev", 1))],
             [("⏹ Обнулить подписку", a("sub0"))],
             [(f"🔑 Устройства ({len(keys)})", a("keys")), (f"💳 Платежи ({len(payments)})", a("pays"))],
+            [(f"🧩 Доп. слоты устройств ({len(slots)})", ASlot(action="list", uid=uid).pack())],
             [("✉️ Написать", a("msg")), ("✅ Разбанить" if u.banned else "⛔ Забанить", a("unban" if u.banned else "ban"))],
             [("🗑 Удалить аккаунт", a("del"))],
             [back(UList(flt="all"), "⬅️ К списку")],
@@ -457,6 +461,65 @@ async def cb_user_pays(call: CallbackQuery, callback_data: AU, db: Database, ser
     await edit_or_send(call, "\n".join(lines), ikb(rows))
 
 
+# ---------- доп. слоты устройств ----------
+
+
+async def _slots_view(db: Database, service: VpnService, uid: int):
+    u = await db.get_user(uid)
+    if u is None:
+        return "Пользователь не найден.", ikb([[back(UList(flt="all"))]])
+    slots = await db.user_slots(uid)
+    days = service.settings.slot_days
+    lines = [
+        f"🧩 <b>Доп. слоты устройств</b> {esc(u.title)}\n",
+        f"По тарифу: {service.base_limit(u)}, итого доступно: {await service.device_limit(u)}\n",
+    ]
+    rows = []
+    for s in slots:
+        state = "✅" if s.active else "⌛"
+        src = "куплен" if s.source == "paid" else "выдан админом"
+        lines.append(f"{state} #{s.id} до {fmt_dt(s.until)} ({src})")
+        rows.append(
+            [
+                (f"#{s.id}: +{days} дн", ASlot(action="ext", uid=uid, id=s.id, arg=days).pack()),
+                (f"−{days} дн", ASlot(action="ext", uid=uid, id=s.id, arg=-days).pack()),
+                ("🗑", ASlot(action="del", uid=uid, id=s.id).pack()),
+            ]
+        )
+    if not slots:
+        lines.append("Доп. слотов нет.")
+    rows.append([(f"➕ Добавить слот на {days} дн", ASlot(action="add", uid=uid, arg=days).pack())])
+    rows.append([back(AU(action="card", uid=uid))])
+    return "\n".join(lines), ikb(rows)
+
+
+@router.callback_query(ASlot.filter())
+async def cb_slots(call: CallbackQuery, callback_data: ASlot, bot: Bot, db: Database, service: VpnService) -> None:
+    uid, action = callback_data.uid, callback_data.action
+    try:
+        if action == "add":
+            slot = await service.add_slot(uid, callback_data.arg)
+            await _notify(
+                bot,
+                uid,
+                f"🎁 Администратор добавил вам слот ещё для одного устройства до {fmt_dt(slot.until)}.",
+            )
+            await call.answer("Слот добавлен")
+        elif action == "ext":
+            slot = await service.extend_slot(callback_data.id, callback_data.arg)
+            await call.answer(f"Слот до {fmt_dt(slot.until)}" if slot else "Готово")
+        elif action == "del":
+            await service.remove_slot(callback_data.id)
+            await call.answer("Слот удалён (если устройств больше лимита — новые отключены)")
+        else:
+            await call.answer()
+    except ServiceError as e:
+        await call.answer(str(e), show_alert=True)
+        return
+    text, kb = await _slots_view(db, service, uid)
+    await edit_or_send(call, text, kb)
+
+
 # ---------- устройства пользователя ----------
 
 
@@ -682,13 +745,25 @@ async def cb_payment_ok(call: CallbackQuery, callback_data: APay, bot: Bot, serv
         await call.answer(f"Платёж принят, но сервер ответил ошибкой: {e}"[:190], show_alert=True)
         return
     p, u = res.payment, res.user
+    limit = await service.device_limit(u)
     await call.answer("Подтверждено")
+    if p.kind == "slot":
+        await _mark_payment_message(
+            call, f"✅ <b>Подтверждено</b> ({esc(call.from_user.full_name)}), устройств теперь: {limit}"
+        )
+        await _notify(
+            bot,
+            u.tg_id,
+            f"✅ Оплата №{p.id} подтверждена! Дополнительный слот добавлен на {days_word(p.days)} — "
+            f"теперь доступно {devices_word(limit)}.\n\nДобавьте устройство в «🔑 Мои устройства».",
+        )
+        return
     await _mark_payment_message(call, f"✅ <b>Подтверждено</b> ({esc(call.from_user.full_name)}), подписка до {fmt_dt(u.sub_until)}")
     await _notify(
         bot,
         u.tg_id,
         f"✅ Оплата №{p.id} подтверждена!\nПодписка активна до <b>{fmt_dt(u.sub_until)}</b>, "
-        f"доступно {devices_word(service.device_limit(u))}.\n\nДобавьте устройства в «🔑 Мои устройства».",
+        f"доступно {devices_word(limit)}.\n\nДобавьте устройства в «🔑 Мои устройства».",
     )
     if res.referrer:
         await _notify(

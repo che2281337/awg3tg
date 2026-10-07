@@ -581,3 +581,87 @@ async def test_multi_vless_move_and_preferred_server(multi):
     nl_ids = MockXrayServer.client_ids(json.load(open(os.path.join(nl.conn[5:], "opt/amnezia/xray/server.json"))))
     assert rk.key.public_key in de_ids and rk.key.public_key not in nl_ids
     assert "@10.0.0.1:443" in moved.vpn_url
+
+
+# ---------- доп. слоты устройств ----------
+
+
+async def test_extra_device_slot(svc, fake_container):
+    user, _ = await svc.db.touch_user(10, "u", "U")
+    plan = (await svc.db.plans())[0]  # 1 месяц, 2 устройства
+    p = await svc.db.create_payment(10, plan, "text", "чек")
+    await svc.confirm_payment(p.id, ADMIN)
+    user = await svc.db.get_user(10)
+    a = await new_device(svc, user, "Телефон")
+    b = await new_device(svc, user, "Ноутбук")
+    with pytest.raises(ServiceError, match="лимит"):
+        await new_device(svc, user, "Планшет")
+
+    # покупка слота: +1 устройство на 30 дней
+    sp = await svc.db.create_slot_payment(10, 100, 30, "text", "чек за слот")
+    assert sp.kind == "slot" and sp.title == "Доп. слот устройства"
+    res = await svc.confirm_payment(sp.id, ADMIN)
+    assert res.referrer is None
+    assert await svc.device_limit(await svc.db.get_user(10)) == 3
+    c = await new_device(svc, user, "Планшет")
+    slot = (await svc.db.user_slots(10))[0]
+    assert slot.until >= now() + 29 * 86400
+
+    # слот закончился — самое новое устройство отключается, остальные работают
+    await svc.db.update_slot(slot.id, until=now() - 1)
+    expired = await svc.expire_slots()
+    assert [s.id for s in expired] == [slot.id]
+    assert [k.enabled for k in await svc.db.user_keys(10)] == [1, 1, 0]
+    assert c.key.public_key not in server_conf(fake_container)
+    assert await svc.expire_slots() == []  # повторно не уведомляем
+
+    # продление того же слота (оплата с slot_id) — устройство снова работает
+    rp = await svc.db.create_slot_payment(10, 100, 30, "text", "продлеваю", slot_id=slot.id)
+    assert rp.title == "Продление доп. слота устройства"
+    await svc.confirm_payment(rp.id, ADMIN)
+    assert len(await svc.db.user_slots(10)) == 1  # не новый слот, а продлённый
+    assert all(k.enabled for k in await svc.db.user_keys(10))
+    assert c.key.public_key in server_conf(fake_container)
+    assert a.key.enabled and b.key.enabled
+
+    # оплата слота не отменяет «новичка»-статус и не считается оплатой подписки
+    assert await svc.db.has_paid(10)  # подписка оплачена выше
+    await svc.db.touch_user(11, "n", "N")
+    await svc.confirm_payment((await svc.db.create_slot_payment(11, 100, 30, "text", "x")).id, ADMIN)
+    assert not await svc.db.has_paid(11)
+
+
+async def test_admin_slots(svc):
+    await svc.db.touch_user(10, "u", "U")
+    user = await svc.extend(10, 30, devices=2)
+    slot = await svc.add_slot(10, 30)
+    assert slot.source == "admin" and await svc.device_limit(user) == 3
+    await svc.extend_slot(slot.id, 30)
+    assert (await svc.db.get_slot(slot.id)).until >= now() + 59 * 86400
+    await svc.extend_slot(slot.id, -60)  # уменьшение срока — слот истёк
+    assert await svc.device_limit(user) == 2
+    second = await svc.add_slot(10, 7)
+    await svc.remove_slot(second.id)
+    assert await svc.db.get_slot(second.id) is None
+    with pytest.raises(ServiceError):
+        await svc.add_slot(10, 0)
+    with pytest.raises(ServiceError):
+        await svc.add_slot(10, 10**9)
+
+
+async def test_slot_notifications(svc):
+    from bot.scheduler import check_subscriptions
+
+    bot = FakeBot()
+    await svc.db.touch_user(10, "u", "U")
+    await svc.extend(10, 60)
+    slot = await svc.add_slot(10, 2)  # закончится через 2 дня
+    await check_subscriptions(bot, svc)
+    await check_subscriptions(bot, svc)
+    texts = [t for _, t in bot.sent]
+    assert sum("слот устройства заканчивается" in t for t in texts) == 1
+    await svc.db.update_slot(slot.id, until=now() - 1)
+    await check_subscriptions(bot, svc)
+    await check_subscriptions(bot, svc)
+    texts = [t for _, t in bot.sent]
+    assert sum("слот устройства закончился" in t for t in texts) == 1

@@ -16,7 +16,7 @@ from aiogram import Bot
 from aiogram.types import BufferedInputFile
 
 from .db import now
-from .handlers.keyboards import renew_kb
+from .handlers.keyboards import SlotCb, ikb, renew_kb, slot_kb
 from .service import VpnService
 from .utils import esc, fmt_dt, left_str
 
@@ -49,6 +49,26 @@ async def check_subscriptions(bot: Bot, service: VpnService) -> None:
             "⛔ Ваша подписка закончилась, устройства отключены.\n"
             "Продлите подписку — ключи заработают снова, перенастраивать ничего не нужно.",
             reply_markup=renew_kb(),
+        )
+
+    # Доп. слоты устройств
+    s = service.settings
+    for slot in await db.slots_expiring(now() + 3 * 86400):
+        await db.update_slot(slot.id, notified=1)
+        await _safe_send(
+            bot,
+            slot.tg_id,
+            f"⏰ Дополнительный слот устройства заканчивается {fmt_dt(slot.until)}.\n"
+            "Продлите его, чтобы все устройства продолжили работать.",
+            reply_markup=slot_kb(slot.id, s.slot_price, s.currency),
+        )
+    for slot in await service.expire_slots():
+        await _safe_send(
+            bot,
+            slot.tg_id,
+            "⏳ Дополнительный слот устройства закончился. Если устройств больше, чем позволяет тариф, "
+            "самые новые отключены (не удалены) — после покупки слота они снова заработают.",
+            reply_markup=ikb([[(f"➕ Купить слот — {s.slot_price} {s.currency}", SlotCb(action="buy").pack())]]),
         )
 
     for days, stage in ((1, STAGE_1_DAY), (3, STAGE_3_DAYS)):

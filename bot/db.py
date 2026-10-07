@@ -92,6 +92,15 @@ CREATE TABLE IF NOT EXISTS payments (
     admin_id     INTEGER
 );
 CREATE INDEX IF NOT EXISTS payments_status ON payments(status);
+CREATE TABLE IF NOT EXISTS slots (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_id      INTEGER NOT NULL,
+    until      INTEGER NOT NULL,                 -- до какого времени действует доп. слот
+    created_at INTEGER NOT NULL,
+    source     TEXT NOT NULL DEFAULT 'paid',     -- paid | admin
+    notified   INTEGER NOT NULL DEFAULT 0        -- 1 = напомнили о конце, 2 = сообщили об окончании
+);
+CREATE INDEX IF NOT EXISTS slots_tg ON slots(tg_id, until);
 """
 
 DEFAULT_PLANS = [
@@ -131,6 +140,8 @@ _MIGRATIONS = {
     },
     "payments": {
         "server_id": "INTEGER",
+        "kind": "TEXT NOT NULL DEFAULT 'plan'",  # plan | slot
+        "slot_id": "INTEGER",  # для продления конкретного доп. слота
     },
 }
 
@@ -245,6 +256,22 @@ class Payment:
     decided_at: int | None
     admin_id: int | None
     server_id: int | None
+    kind: str
+    slot_id: int | None
+
+
+@dataclass
+class Slot:
+    id: int
+    tg_id: int
+    until: int
+    created_at: int
+    source: str
+    notified: int
+
+    @property
+    def active(self) -> bool:
+        return self.until > now()
 
 
 @dataclass
@@ -358,6 +385,7 @@ class Database:
     async def delete_user(self, tg_id: int) -> None:
         await self.c.execute("DELETE FROM keys WHERE tg_id = ?", (tg_id,))
         await self.c.execute("DELETE FROM traffic_daily WHERE tg_id = ?", (tg_id,))
+        await self.c.execute("DELETE FROM slots WHERE tg_id = ?", (tg_id,))
         await self.c.execute("UPDATE users SET referrer_id = NULL WHERE referrer_id = ?", (tg_id,))
         await self.c.execute("DELETE FROM users WHERE tg_id = ?", (tg_id,))
         await self.c.commit()
@@ -663,6 +691,58 @@ class Database:
         assert p
         return p
 
+    async def create_slot_payment(
+        self, tg_id: int, amount: int, days: int, receipt_type: str, receipt: str, slot_id: int | None = None
+    ) -> Payment:
+        title = "Продление доп. слота устройства" if slot_id else "Доп. слот устройства"
+        cur = await self.c.execute(
+            """INSERT INTO payments
+               (tg_id, plan_id, title, days, devices, amount, receipt_type, receipt, created_at, kind, slot_id)
+               VALUES (?, NULL, ?, ?, 1, ?, ?, ?, ?, 'slot', ?)""",
+            (tg_id, title, days, amount, receipt_type, receipt, now(), slot_id),
+        )
+        await self.c.commit()
+        p = await self.get_payment(cur.lastrowid)
+        assert p
+        return p
+
+    # ---------- доп. слоты устройств ----------
+
+    async def add_slot(self, tg_id: int, until: int, source: str = "paid") -> Slot:
+        cur = await self.c.execute(
+            "INSERT INTO slots (tg_id, until, created_at, source) VALUES (?, ?, ?, ?)", (tg_id, until, now(), source)
+        )
+        await self.c.commit()
+        slot = await self.get_slot(cur.lastrowid)
+        assert slot
+        return slot
+
+    async def get_slot(self, slot_id: int) -> Slot | None:
+        return await self._one(Slot, "SELECT * FROM slots WHERE id = ?", (slot_id,))
+
+    async def user_slots(self, tg_id: int, active_only: bool = False) -> list[Slot]:
+        where = "AND until > ?" if active_only else ""
+        args = (tg_id, now()) if active_only else (tg_id,)
+        return await self._all(Slot, f"SELECT * FROM slots WHERE tg_id = ? {where} ORDER BY until", args)
+
+    async def active_slot_count(self, tg_id: int) -> int:
+        return await self._scalar("SELECT COUNT(*) FROM slots WHERE tg_id = ? AND until > ?", (tg_id, now())) or 0
+
+    async def update_slot(self, slot_id: int, **fields) -> None:
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        await self._exec(f"UPDATE slots SET {sets} WHERE id = ?", (*fields.values(), slot_id))
+
+    async def delete_slot(self, slot_id: int) -> None:
+        await self._exec("DELETE FROM slots WHERE id = ?", (slot_id,))
+
+    async def slots_expiring(self, before: int) -> list[Slot]:
+        return await self._all(
+            Slot, "SELECT * FROM slots WHERE until > ? AND until <= ? AND notified = 0", (now(), before)
+        )
+
+    async def slots_expired_unnotified(self) -> list[Slot]:
+        return await self._all(Slot, "SELECT * FROM slots WHERE until <= ? AND notified < 2", (now(),))
+
     async def get_payment(self, payment_id: int) -> Payment | None:
         return await self._one(Payment, "SELECT * FROM payments WHERE id = ?", (payment_id,))
 
@@ -688,7 +768,10 @@ class Database:
         )
 
     async def has_paid(self, tg_id: int) -> bool:
-        return bool(await self._scalar("SELECT 1 FROM payments WHERE tg_id = ? AND status = 'paid'", (tg_id,)))
+        """Оплачивал ли подписку (оплаты доп. слотов не считаются)."""
+        return bool(
+            await self._scalar("SELECT 1 FROM payments WHERE tg_id = ? AND status = 'paid' AND kind = 'plan'", (tg_id,))
+        )
 
     # ---------- статистика ----------
 
