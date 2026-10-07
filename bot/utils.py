@@ -42,16 +42,21 @@ def days_ago(days: int) -> str:
     return (local_now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
 
-def fmt_dt(ts: int | None) -> str:
+def _fmt(ts: int | None, pattern: str) -> str:
     if not ts:
         return "—"
-    return datetime.fromtimestamp(ts, _tz).strftime("%d.%m.%Y %H:%M")
+    try:
+        return datetime.fromtimestamp(ts, _tz).strftime(pattern)
+    except (OverflowError, OSError, ValueError):  # битое значение в БД не должно ломать экран
+        return "∞" if ts > 0 else "—"
+
+
+def fmt_dt(ts: int | None) -> str:
+    return _fmt(ts, "%d.%m.%Y %H:%M")
 
 
 def fmt_date(ts: int | None) -> str:
-    if not ts:
-        return "—"
-    return datetime.fromtimestamp(ts, _tz).strftime("%d.%m.%Y")
+    return _fmt(ts, "%d.%m.%Y")
 
 
 def human_bytes(n: int) -> str:

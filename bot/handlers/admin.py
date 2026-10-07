@@ -12,7 +12,7 @@ from aiogram.types import CallbackQuery, Message, TelegramObject
 from ..awg.conf import protocol_version
 from ..awg.server import AwgError
 from ..db import Database, User, now
-from ..service import ServiceError, VpnService
+from ..service import MAX_DAYS, MAX_DEVICES, ServiceError, VpnService
 from ..utils import (
     day_start_ts,
     days_word,
@@ -34,6 +34,8 @@ log = logging.getLogger(__name__)
 router = Router(name="admin")
 
 PAGE = 10
+MAX_PLAN_DAYS = 3650
+MAX_PRICE = 10_000_000
 FILTERS = {"all": "Все", "active": "С подпиской", "expired": "Без подписки", "banned": "Бан"}
 BCAST_TARGETS = {"all": "всем", "active": "с активной подпиской", "expired": "без подписки"}
 
@@ -235,6 +237,8 @@ async def _extend(bot: Bot, service: VpnService, uid: int, days: int) -> str:
         user = await service.extend(uid, days)
         await _notify(bot, uid, f"🎉 Подписка продлена на {days_word(days)} — до {fmt_dt(user.sub_until)}.")
     else:
+        if days < -MAX_DAYS:
+            raise ServiceError(f"Срок должен быть от -{MAX_DAYS} до {MAX_DAYS} дней.")
         until = (user.sub_until or now()) + days * 86400
         await service.set_sub_until(uid, until)
         user = await service.db.get_user(uid)
@@ -306,7 +310,7 @@ async def cb_dev_limit(call: CallbackQuery, callback_data: AU, db: Database, ser
         await call.answer("Не найден", show_alert=True)
         return
     current = u.device_limit or service.settings.default_devices
-    new = max(0, current + callback_data.arg)
+    new = max(0, min(current + callback_data.arg, MAX_DEVICES))
     await service.set_device_limit(u.tg_id, new)
     await call.answer(f"Лимит устройств: {new}")
     await _refresh_card(call, db, service, u.tg_id)
@@ -728,11 +732,14 @@ async def cb_plan_edit(call: CallbackQuery, callback_data: APlan, state: FSMCont
 async def st_plan(message: Message, state: FSMContext, db: Database) -> None:
     parts = [p.strip() for p in message.text.split("|")]
     try:
-        title, days, devices, price = parts[0], int(parts[1]), int(parts[2]), int(parts[3])
-        if not title or days <= 0 or devices <= 0 or price < 0:
+        title, days, devices, price = parts[0][:64], int(parts[1]), int(parts[2]), int(parts[3])
+        if not title or not 0 < days <= MAX_PLAN_DAYS or not 0 < devices <= MAX_DEVICES or not 0 <= price <= MAX_PRICE:
             raise ValueError
     except (IndexError, ValueError):
-        await message.answer("Не получилось разобрать. " + PLAN_FORMAT)
+        await message.answer(
+            f"Не получилось разобрать. Допустимо: дней 1–{MAX_PLAN_DAYS}, устройств 1–{MAX_DEVICES}, "
+            f"цена 0–{MAX_PRICE}, название до 64 символов.\n\n" + PLAN_FORMAT
+        )
         return
     data = await state.get_data()
     await state.clear()

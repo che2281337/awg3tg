@@ -234,6 +234,8 @@ class Database:
         return self.conn
 
     async def _one(self, cls, sql: str, args: tuple = ()):
+        if any(isinstance(a, int) and not -(2**63) <= a < 2**63 for a in args):
+            return None  # подделанный гигантский ID из кнопки — такой записи быть не может
         async with self.c.execute(sql, args) as cur:
             row = await cur.fetchone()
         return cls(**{k: row[k] for k in _fields(cls)}) if row else None

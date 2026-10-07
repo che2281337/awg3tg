@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, ErrorEvent
 
 from .awg.mock import MockAwgServer
 from .awg.server import AwgServer
@@ -31,7 +31,23 @@ def build_dispatcher(settings: Settings, db: Database, service: VpnService) -> D
     dp.callback_query.outer_middleware(mw)
     dp.include_router(admin.router)
     dp.include_router(user.router)
+    dp.errors.register(on_error)
     return dp
+
+
+async def on_error(event: ErrorEvent) -> bool:
+    """Любая ошибка в обработчике (битые данные, подделанная кнопка и т.п.) логируется,
+    пользователь получает короткий ответ, а бот продолжает работать."""
+    logging.getLogger("bot").error("Ошибка при обработке апдейта", exc_info=event.exception)
+    update = event.update
+    try:
+        if update.callback_query:
+            await update.callback_query.answer("Произошла ошибка, попробуйте ещё раз", show_alert=True)
+        elif update.message:
+            await update.message.answer("Произошла ошибка, попробуйте ещё раз.")
+    except Exception:
+        pass
+    return True
 
 
 async def main() -> None:

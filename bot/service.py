@@ -21,6 +21,16 @@ log = logging.getLogger(__name__)
 
 ADMIN_DEVICE_LIMIT = 100
 
+# Защита от переполнения: SQLite хранит 64-битные числа, а даты дальше 9999 года
+# Python не форматирует. Сроки и лимиты ограничены разумными значениями.
+MAX_DAYS = 36500  # за одну операцию — 100 лет
+MAX_SUB_UNTIL = 4102444800  # 01.01.2100 — дальше подписка не продлевается
+MAX_DEVICES = 100
+
+
+def clamp_ts(ts: int) -> int:
+    return max(0, min(int(ts), MAX_SUB_UNTIL))
+
 
 class ServiceError(Exception):
     """Ошибка, текст которой можно показать пользователю."""
@@ -196,10 +206,12 @@ class VpnService:
         user = await self.db.get_user(tg_id)
         if user is None:
             raise ServiceError("Пользователь не найден.")
+        if not -MAX_DAYS <= days <= MAX_DAYS:
+            raise ServiceError(f"Срок должен быть от -{MAX_DAYS} до {MAX_DAYS} дней.")
         base = max(now(), user.sub_until or 0)
-        fields: dict = {"sub_until": base + days * 86400, "notified": 0}
+        fields: dict = {"sub_until": clamp_ts(base + days * 86400), "notified": 0}
         if devices is not None:
-            fields["device_limit"] = devices
+            fields["device_limit"] = max(0, min(devices, MAX_DEVICES))
         elif not user.device_limit:
             fields["device_limit"] = self.settings.default_devices
         await self.db.update_user(tg_id, **fields)
@@ -209,11 +221,11 @@ class VpnService:
         return user
 
     async def set_sub_until(self, tg_id: int, until: int | None) -> None:
-        await self.db.update_user(tg_id, sub_until=until, notified=0)
+        await self.db.update_user(tg_id, sub_until=None if until is None else clamp_ts(until), notified=0)
         await self.sync_user(tg_id)
 
     async def set_device_limit(self, tg_id: int, limit: int) -> None:
-        await self.db.update_user(tg_id, device_limit=max(0, limit))
+        await self.db.update_user(tg_id, device_limit=max(0, min(limit, MAX_DEVICES)))
         await self.sync_user(tg_id)
 
     def trial_available(self, user: User) -> bool:

@@ -242,3 +242,27 @@ async def test_mock_server(tmp_path):
     await service.delete_device(rk.key)
     assert rk.key.public_key not in (tmp_path / "mock/opt/amnezia/awg/awg0.conf").read_text()
     await db.close()
+
+
+async def test_huge_values_are_rejected_or_clamped(svc):
+    from bot.service import MAX_DAYS, MAX_DEVICES, MAX_SUB_UNTIL
+    from bot.utils import fmt_dt
+
+    await svc.db.touch_user(10, "u", "U")
+    for days in (99999999999999999999999, MAX_DAYS + 1, -(10**30)):
+        with pytest.raises(ServiceError):
+            await svc.extend(10, days)
+    assert (await svc.db.get_user(10)).sub_until is None  # ничего не сохранилось
+
+    for _ in range(50):  # даже много продлений подряд не уходят за 2100 год
+        await svc.extend(10, MAX_DAYS)
+    user = await svc.db.get_user(10)
+    assert user.sub_until == MAX_SUB_UNTIL and fmt_dt(user.sub_until).startswith("01.01.2100")
+
+    await svc.set_sub_until(10, -(10**12))
+    assert (await svc.db.get_user(10)).sub_until == 0
+    await svc.set_device_limit(10, 10**30)
+    assert (await svc.db.get_user(10)).device_limit == MAX_DEVICES
+
+    # если в базе всё же оказалось мусорное значение — экран не ломается
+    assert fmt_dt(10**17) == "∞" and fmt_dt(-(10**15)) == "—"
