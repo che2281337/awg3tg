@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+case "$1" in
+  syncconf) cat "$3" > "$FAKE_ROOT/applied.conf" ;;
+  show)
+    printf 'privkey\tpubkey\t55424\toff\n'
+    grep -E '^PublicKey' "$FAKE_ROOT/opt/amnezia/awg/awg0.conf" | awk '{print $3}' | while read -r k; do
+      printf '%s\tpsk\t1.2.3.4:5555\t10.8.1.2/32\t1700000000\t1024\t2048\t25\n' "$k"
+    done ;;
+esac

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Поддельный xray: проверка конфига и Stats API
+case "$1" in
+  run)  # xray run -test -config FILE; FAKE_XRAY_REJECT_API=1 — «старый» Xray без Stats API
+    python3 -c "
+import json, os, sys
+cfg = json.load(open(sys.argv[1]))
+if os.environ.get('FAKE_XRAY_REJECT_API') and 'api' in cfg:
+    print('unknown field api'); sys.exit(1)
+" "$4" ;;
+  api)  # xray api statsquery ...: трафик для всех клиентов с email
+    python3 - "$FAKE_ROOT/opt/amnezia/xray/server.json" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+stat = []
+for inb in cfg.get("inbounds", []):
+    for c in (inb.get("settings") or {}).get("clients", []):
+        if c.get("email"):
+            stat.append({"name": f"user>>>{c['email']}>>>traffic>>>uplink", "value": "4096"})
+            stat.append({"name": f"user>>>{c['email']}>>>traffic>>>downlink", "value": "8192"})
+print(json.dumps({"stat": stat}))
+PY
+    ;;
+esac
