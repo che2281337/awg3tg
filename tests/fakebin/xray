@@ -2,12 +2,18 @@
 # Поддельный xray: проверка конфига и Stats API
 case "$1" in
   run)  # xray run -test -config FILE; FAKE_XRAY_REJECT_API=1 — «старый» Xray без Stats API
-    python3 -c "
+    python3 - "$4" <<'PY'
 import json, os, sys
-cfg = json.load(open(sys.argv[1]))
-if os.environ.get('FAKE_XRAY_REJECT_API') and 'api' in cfg:
-    print('unknown field api'); sys.exit(1)
-" "$4" ;;
+path = sys.argv[1]
+if not path.endswith(".json"):  # как настоящий Xray: формат определяется по расширению
+    print("core: Failed to get format of " + path)
+    sys.exit(23)
+cfg = json.load(open(path))
+if os.environ.get("FAKE_XRAY_REJECT_API") and "api" in cfg:
+    print("unknown field api")
+    sys.exit(1)
+PY
+    ;;
   api)  # xray api statsquery ...: трафик для всех клиентов с email
     python3 - "$FAKE_ROOT/opt/amnezia/xray/server.json" <<'PY'
 import json, sys
