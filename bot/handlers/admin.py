@@ -26,7 +26,7 @@ from ..utils import (
     plural,
     today,
 )
-from .common import deliver_key, edit_or_send, send_long
+from .common import deliver_key, edit_or_send, notify_payment_confirmed, send_long
 from .keyboards import (
     AK,
     AU,
@@ -745,33 +745,14 @@ async def cb_payment_ok(call: CallbackQuery, callback_data: APay, bot: Bot, serv
         await call.answer(f"Платёж принят, но сервер ответил ошибкой: {e}"[:190], show_alert=True)
         return
     p, u = res.payment, res.user
-    limit = await service.device_limit(u)
     await call.answer("Подтверждено")
+    who = esc(call.from_user.full_name)
     if p.kind == "slot":
-        await _mark_payment_message(
-            call, f"✅ <b>Подтверждено</b> ({esc(call.from_user.full_name)}), устройств теперь: {limit}"
-        )
-        await _notify(
-            bot,
-            u.tg_id,
-            f"✅ Оплата №{p.id} подтверждена! Дополнительный слот добавлен на {days_word(p.days)} — "
-            f"теперь доступно {devices_word(limit)}.\n\nДобавьте устройство в «🔑 Мои устройства».",
-        )
-        return
-    await _mark_payment_message(call, f"✅ <b>Подтверждено</b> ({esc(call.from_user.full_name)}), подписка до {fmt_dt(u.sub_until)}")
-    await _notify(
-        bot,
-        u.tg_id,
-        f"✅ Оплата №{p.id} подтверждена!\nПодписка активна до <b>{fmt_dt(u.sub_until)}</b>, "
-        f"доступно {devices_word(limit)}.\n\nДобавьте устройства в «🔑 Мои устройства».",
-    )
-    if res.referrer:
-        await _notify(
-            bot,
-            res.referrer.tg_id,
-            f"🎁 Ваш друг оплатил подписку — вам начислено +{days_word(service.settings.ref_bonus_days)}. "
-            f"Подписка до {fmt_dt(res.referrer.sub_until)}.",
-        )
+        done = f"устройств теперь: {await service.device_limit(u)}"
+    else:
+        done = f"подписка до {fmt_dt(u.sub_until)}"
+    await _mark_payment_message(call, f"✅ <b>Подтверждено</b> ({who}), {done}")
+    await notify_payment_confirmed(bot, service, res)
 
 
 @router.callback_query(APay.filter(F.action == "no"))

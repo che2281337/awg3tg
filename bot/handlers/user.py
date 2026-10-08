@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
@@ -9,8 +10,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from ..awg.server import AwgError
-from ..db import PROTOCOLS, Database, User, now
-from ..service import ServiceError, VpnService
+from ..db import PROTOCOLS, Database, Payment, User, now
+from ..service import AutoPayment, ServiceError, VpnService
+from ..yoomoney import YooMoneyError
 from ..utils import (
     days_word,
     devices_word,
@@ -23,7 +25,7 @@ from ..utils import (
     plural,
     today,
 )
-from .common import deliver_key, edit_or_send, help_text, notify_admins
+from .common import deliver_key, edit_or_send, help_text, notify_admins, notify_payment_confirmed
 from .keyboards import (
     BTN_DEVICES,
     BTN_HELP,
@@ -41,6 +43,7 @@ from .keyboards import (
     DevProto,
     Loc,
     Menu,
+    PayCheck,
     back,
     ikb,
     main_menu,
@@ -228,12 +231,14 @@ async def cb_devices(call: CallbackQuery, state: FSMContext, db: Database, servi
 
 
 @router.callback_query(Menu.filter(F.action == "add"))
-async def cb_add_device(call: CallbackQuery, state: FSMContext, db: Database, service: VpnService, user: User) -> None:
+async def cb_add_device(
+    call: CallbackQuery, bot: Bot, state: FSMContext, db: Database, service: VpnService, user: User
+) -> None:
     if not service.has_access(user):
         await call.answer("Нет активной подписки", show_alert=True)
         return
     if len(await db.user_keys(user.tg_id)) >= await service.device_limit(user):
-        await cb_slot_offer(call, SlotCb(action="buy"), service, user)
+        await cb_slot_offer(call, SlotCb(action="buy"), bot, service, user)
         return
     servers = await service.available_servers()
     if not servers:
@@ -550,10 +555,45 @@ async def cb_plans(call: CallbackQuery, db: Database, service: VpnService, user:
     await edit_or_send(call, text, kb)
 
 
+PAY_METHOD = {"AC": "💳 Оплатить картой", "PC": "💳 Оплатить через ЮMoney"}
+MANUAL_HINT = "После оплаты нажмите «✅ Я оплатил» и отправьте скриншот или чек."
+
+
+async def _invoice_screen(
+    call: CallbackQuery,
+    bot: Bot,
+    service: VpnService,
+    payment: Payment,
+    head: str,
+    manual_cb: str,
+    back_cb: str,
+    note: str = "",
+) -> None:
+    s = service.settings
+    me = await bot.me()
+    url = service.pay_url(payment, f"https://t.me/{me.username}" if me.username else "")
+    what = "Подписка активируется" if payment.kind == "plan" else "Слот добавится"
+    text = (
+        head + f"К оплате: <b>{payment.amount} {s.currency}</b>{note}\n\n"
+        "Нажмите кнопку оплаты — откроется страница ЮMoney, там можно оплатить любой банковской картой. "
+        f"{what} автоматически в течение минуты после оплаты, я пришлю сообщение."
+    )
+    rows = [
+        [(f"{PAY_METHOD.get(s.yoomoney_payment_type, PAY_METHOD['AC'])} — {payment.amount} {s.currency}", url)],
+        [("🔄 Я оплатил — проверить", PayCheck(id=payment.id).pack())],
+    ]
+    if s.manual_payments:
+        rows.append([("🧾 Перевод по реквизитам", manual_cb)])
+    rows.append([back(back_cb)])
+    await edit_or_send(call, text, ikb(rows))
+
+
 # «srv» оставлен для старых кнопок в чатах (раньше при покупке выбирали сервер).
-@router.callback_query(Buy.filter(F.action.in_({"plan", "srv"})))
-async def cb_buy_plan(call: CallbackQuery, callback_data: Buy, db: Database, service: VpnService, user: User) -> None:
-    """Шаг 2: реквизиты для оплаты. Сервер выбирается позже — при создании устройства."""
+@router.callback_query(Buy.filter(F.action.in_({"plan", "srv", "manual"})))
+async def cb_buy_plan(
+    call: CallbackQuery, callback_data: Buy, bot: Bot, db: Database, service: VpnService, user: User
+) -> None:
+    """Шаг 2: оплата. Сервер выбирается позже — при создании устройства."""
     plan = await db.get_plan(callback_data.plan_id)
     if plan is None or not plan.active:
         await call.answer("Тариф недоступен", show_alert=True)
@@ -561,33 +601,36 @@ async def cb_buy_plan(call: CallbackQuery, callback_data: Buy, db: Database, ser
     await call.answer()
     s = service.settings
     price = await service.price_for(user, plan)
+    head = f"<b>{esc(plan.title)}</b>\nСрок: {days_word(plan.days)}, {devices_word(plan.devices)}\n"
+    autopay = service.autopay and price > 0
+    if autopay and callback_data.action != "manual":
+        invoice = await service.plan_invoice(user, plan)
+        manual_cb = Buy(action="manual", plan_id=plan.id).pack()
+        note = f" <s>{plan.price} {s.currency}</s> — скидка новичка" if invoice.amount < plan.price else ""
+        await _invoice_screen(call, bot, service, invoice, head, manual_cb, Menu(action="plans").pack(), note)
+        return
     note = f" <s>{plan.price} {s.currency}</s> — скидка новичка" if price < plan.price else ""
-    text = (
-        f"<b>{esc(plan.title)}</b>\n"
-        f"Срок: {days_word(plan.days)}, {devices_word(plan.devices)}\n"
-        f"К оплате: <b>{price} {s.currency}</b>{note}\n\n"
-        f"{s.payment_details}\n\n"
-        "После оплаты нажмите «✅ Я оплатил» и отправьте скриншот или чек."
-    )
+    text = head + f"К оплате: <b>{price} {s.currency}</b>{note}\n\n{s.payment_details}\n\n{MANUAL_HINT}"
+    back_cb = Buy(action="plan", plan_id=plan.id) if autopay else Menu(action="plans")
     await edit_or_send(
-        call,
-        text,
-        ikb([[("✅ Я оплатил", Buy(action="paid", plan_id=plan.id).pack())], [back(Menu(action="plans"))]]),
+        call, text, ikb([[("✅ Я оплатил", Buy(action="paid", plan_id=plan.id).pack())], [back(back_cb)]])
     )
 
 
 # ---------- доп. слоты устройств ----------
 
 
-@router.callback_query(SlotCb.filter(F.action.in_({"buy", "renew"})))
-async def cb_slot_offer(call: CallbackQuery, callback_data: SlotCb, service: VpnService, user: User) -> None:
+@router.callback_query(SlotCb.filter(F.action.in_({"buy", "renew", "manual"})))
+async def cb_slot_offer(
+    call: CallbackQuery, callback_data: SlotCb, bot: Bot, service: VpnService, user: User
+) -> None:
     """Покупка ещё одного устройства сверх тарифа (или продление слота)."""
     s = service.settings
     if not service.has_access(user):
         await call.answer("Сначала оформите или продлите подписку в «💳 Тарифы»", show_alert=True)
         return
     slot = None
-    if callback_data.action == "renew":
+    if callback_data.id:
         slot = await service.db.get_slot(callback_data.id)
         if slot is None or slot.tg_id != user.tg_id:
             await call.answer("Слот не найден", show_alert=True)
@@ -605,17 +648,80 @@ async def cb_slot_offer(call: CallbackQuery, callback_data: SlotCb, service: Vpn
             f"Сейчас доступно {devices_word(limit)}. Дополнительный слот добавит ещё одно устройство "
             f"на {days_word(s.slot_days)} (подписка при этом не меняется).\n"
         )
-    text = (
-        head
-        + f"К оплате: <b>{s.slot_price} {s.currency}</b>\n\n"
-        f"{s.payment_details}\n\n"
-        "После оплаты нажмите «✅ Я оплатил» и отправьте скриншот или чек."
-    )
+    slot_id = slot.id if slot else 0
+    autopay = service.autopay and s.slot_price > 0
+    if autopay and callback_data.action != "manual":
+        invoice = await service.slot_invoice(user, slot.id if slot else None)
+        manual_cb = SlotCb(action="manual", id=slot_id).pack()
+        await _invoice_screen(call, bot, service, invoice, head, manual_cb, Menu(action="devices").pack())
+        return
+    text = head + f"К оплате: <b>{s.slot_price} {s.currency}</b>\n\n{s.payment_details}\n\n{MANUAL_HINT}"
+    back_cb = SlotCb(action="renew" if slot else "buy", id=slot_id) if autopay else Menu(action="devices")
     await edit_or_send(
-        call,
-        text,
-        ikb([[("✅ Я оплатил", SlotCb(action="paid", id=slot.id if slot else 0).pack())], [back(Menu(action="devices"))]]),
+        call, text, ikb([[("✅ Я оплатил", SlotCb(action="paid", id=slot_id).pack())], [back(back_cb)]])
     )
+
+
+# ---------- автооплата ЮMoney ----------
+
+CHECK_COOLDOWN = 5
+_last_check: dict[int, float] = {}
+
+
+@router.callback_query(PayCheck.filter())
+async def cb_pay_check(
+    call: CallbackQuery, callback_data: PayCheck, bot: Bot, db: Database, service: VpnService, user: User
+) -> None:
+    p = await db.get_payment(callback_data.id)
+    if p is None or p.tg_id != user.tg_id:
+        await call.answer("Счёт не найден", show_alert=True)
+        return
+    if p.status == "paid":
+        await call.answer("✅ Этот счёт уже оплачен", show_alert=True)
+        return
+    if p.status == "pending":
+        await call.answer("Оплата на проверке у администратора — я пришлю уведомление.", show_alert=True)
+        return
+    if p.status not in ("invoice", "expired"):
+        await call.answer("Счёт не найден", show_alert=True)
+        return
+    t = time.monotonic()
+    if t - _last_check.get(user.tg_id, 0) < CHECK_COOLDOWN:
+        await call.answer("Проверяю… подождите пару секунд", show_alert=False)
+        return
+    _last_check[user.tg_id] = t
+    try:
+        results = await service.check_invoices(p)
+    except YooMoneyError as e:
+        log.warning("ЮMoney: проверка счёта №%s: %s", p.id, e)
+        await call.answer("Не удалось связаться с ЮMoney, попробуйте через минуту.", show_alert=True)
+        return
+    if not results:
+        await call.answer(
+            "Оплата пока не поступила. Обычно ЮMoney присылает её в течение минуты — "
+            "я сообщу автоматически, нажимать ничего не нужно.",
+            show_alert=True,
+        )
+        return
+    await call.answer()
+    await process_autopay(bot, service, results)
+
+
+async def process_autopay(bot: Bot, service: VpnService, results: list[AutoPayment]) -> None:
+    """Сообщения по найденным оплатам ЮMoney (из фоновой проверки и кнопки «Проверить»)."""
+    for r in results:
+        if r.result:
+            await notify_payment_confirmed(bot, service, r.result, auto=True)
+            continue
+        try:
+            await bot.send_message(
+                r.payment.tg_id,
+                f"💳 Оплата по счёту №{r.payment.id} получена, но сумма меньше нужной. "
+                "Я передал её администратору — он проверит и активирует покупку.",
+            )
+        except Exception:
+            pass
+        await send_payment_to_admins(bot, service, r.payment.id)
 
 
 @router.callback_query(SlotCb.filter(F.action == "paid"))

@@ -1,4 +1,4 @@
-"""Фоновые задачи: сбор трафика, окончание подписок, напоминания, проверка серверов, бэкап."""
+"""Фоновые задачи: автооплата ЮMoney, сбор трафика, окончание подписок, напоминания, проверка серверов, бэкап."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from .db import now
 from .handlers.keyboards import SlotCb, ikb, renew_kb, slot_kb
 from .service import VpnService
 from .utils import esc, fmt_dt, left_str
+from .yoomoney import YooMoneyError
 
 log = logging.getLogger(__name__)
 
@@ -152,6 +153,18 @@ async def send_backup(bot: Bot, service: VpnService, force: bool = False) -> boo
     return True
 
 
+async def check_payments(bot: Bot, service: VpnService) -> None:
+    """Автооплата: ищет оплаченные счета в истории кошелька ЮMoney."""
+    from .handlers.user import process_autopay
+
+    try:
+        results = await service.check_invoices()
+    except YooMoneyError as e:
+        log.warning("ЮMoney: %s", e)
+        return
+    await process_autopay(bot, service, results)
+
+
 async def _loop(name: str, interval: int, func, *args) -> None:
     while True:
         try:
@@ -164,7 +177,11 @@ async def _loop(name: str, interval: int, func, *args) -> None:
 
 
 def start_background(bot: Bot, service: VpnService) -> list[asyncio.Task]:
-    return [
+    tasks = []
+    if service.yoomoney is not None:
+        interval = service.settings.yoomoney_check_interval
+        tasks.append(asyncio.create_task(_loop("yoomoney", interval, check_payments, bot, service)))
+    return tasks + [
         asyncio.create_task(_loop("traffic", service.settings.stats_interval, service.collect_traffic)),
         asyncio.create_task(_loop("subscriptions", 60, check_subscriptions, bot, service)),
         asyncio.create_task(_loop("servers", 120, check_servers, bot, service)),
