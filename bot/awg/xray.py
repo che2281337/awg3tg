@@ -197,7 +197,8 @@ class XrayServer(ContainerClient):
 
     async def _save(self, cfg: dict) -> None:
         """Пишет server.json только если Xray его принимает — сломанный конфиг уронил бы VLESS."""
-        tmp = SERVER_CONFIG + ".new"
+        # Xray определяет формат по расширению — временный файл обязательно *.json
+        tmp = f"{XRAY_DIR}/server.bot-check.json"
         with_api = json.loads(json.dumps(cfg))
         ensure_stats_api(with_api)
         for candidate in (with_api, cfg):  # без статистики — если эта версия Xray её не принимает
