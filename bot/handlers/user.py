@@ -131,12 +131,10 @@ async def profile_view(db: Database, service: VpnService, user: User) -> tuple[s
         sub = f"⛔ закончилась {fmt_dt(user.sub_until)}"
     else:
         sub = "нет"
-    home = await db.get_server(user.server_id) if user.server_id else None
     text = (
         f"👤 <b>Профиль</b>\n\n"
         f"ID: <code>{user.tg_id}</code>\n"
         f"Подписка: {sub}\n"
-        f"Сервер: {esc(home.title) if home else 'не выбран'}\n"
         f"Устройства: {len(keys)} из {limit}{await slots_line(db, service, user)}\n\n"
         f"📊 <b>Трафик</b> (скачано / отдано)\n"
         f"Сегодня: {human_bytes(t_today.tx)} / {human_bytes(t_today.rx)}\n"
@@ -145,33 +143,7 @@ async def profile_view(db: Database, service: VpnService, user: User) -> tuple[s
     )
     rows = [[("💳 Продлить подписку" if user.active else "💳 Оформить подписку", Menu(action="plans").pack())]]
     rows.append([("🔑 Мои устройства", Menu(action="devices").pack())])
-    if len(await service.available_servers()) > 1:
-        rows.append([("🌍 Сменить сервер", Loc(action="home").pack())])
     return text, ikb(rows)
-
-
-@router.callback_query(Loc.filter(F.action == "home"))
-async def cb_home_server(call: CallbackQuery, callback_data: Loc, db: Database, service: VpnService, user: User) -> None:
-    servers = await service.available_servers()
-    if not callback_data.sid:
-        await call.answer()
-        rows = [[(("✅ " if s.id == user.server_id else "") + s.title, Loc(action="home", sid=s.id).pack())] for s in servers]
-        rows.append([back(Menu(action="profile"))])
-        await edit_or_send(
-            call,
-            "🌍 Выберите сервер. Новые устройства будут создаваться на нём.\n"
-            "Уже добавленные устройства можно перенести в их карточке («🌍 Сменить локацию»).",
-            ikb(rows),
-        )
-        return
-    if callback_data.sid not in {s.id for s in servers}:
-        await call.answer("Этот сервер сейчас недоступен", show_alert=True)
-        return
-    await service.set_user_server(user.tg_id, callback_data.sid)
-    await call.answer("Сервер изменён")
-    user = await db.get_user(user.tg_id) or user
-    text, kb = await profile_view(db, service, user)
-    await edit_or_send(call, text, kb)
 
 
 @router.message(Command("profile"))
@@ -268,12 +240,7 @@ async def cb_add_device(call: CallbackQuery, state: FSMContext, db: Database, se
         await call.answer("Сейчас нет доступных серверов, попробуйте чуть позже", show_alert=True)
         return
     await call.answer()
-    # Сервер выбран при покупке тарифа — сразу к выбору протокола.
-    home = await service.user_server(user)
-    if home is not None:
-        await _ask_protocol(call, state, home)
-        return
-    if len(servers) == 1:
+    if len(servers) == 1:  # выбирать не из чего — сразу к протоколу
         await _ask_protocol(call, state, servers[0])
         return
     rows = [[(s.title, Loc(action="new", key=0, sid=s.id).pack())] for s in servers]
@@ -583,65 +550,29 @@ async def cb_plans(call: CallbackQuery, db: Database, service: VpnService, user:
     await edit_or_send(call, text, kb)
 
 
-@router.callback_query(Buy.filter(F.action == "plan"))
+# «srv» оставлен для старых кнопок в чатах (раньше при покупке выбирали сервер).
+@router.callback_query(Buy.filter(F.action.in_({"plan", "srv"})))
 async def cb_buy_plan(call: CallbackQuery, callback_data: Buy, db: Database, service: VpnService, user: User) -> None:
-    """Шаг 2: после тарифа — выбор сервера (страны)."""
+    """Шаг 2: реквизиты для оплаты. Сервер выбирается позже — при создании устройства."""
     plan = await db.get_plan(callback_data.plan_id)
     if plan is None or not plan.active:
         await call.answer("Тариф недоступен", show_alert=True)
-        return
-    servers = await service.available_servers()
-    if len(servers) <= 1:  # выбирать не из чего — сразу к оплате
-        await cb_buy_server(call, Buy(action="srv", plan_id=plan.id, sid=servers[0].id if servers else 0), db, service, user)
-        return
-    await call.answer()
-    rows = [
-        [(("✅ " if s.id == user.server_id else "") + s.title, Buy(action="srv", plan_id=plan.id, sid=s.id).pack())]
-        for s in servers
-    ]
-    rows.append([back(Menu(action="plans"))])
-    await edit_or_send(
-        call,
-        f"<b>{esc(plan.title)}</b>\n\n🌍 Выберите сервер (страну). На нём будут создаваться ваши устройства — "
-        "потом его можно сменить в профиле.",
-        ikb(rows),
-    )
-
-
-@router.callback_query(Buy.filter(F.action == "srv"))
-async def cb_buy_server(call: CallbackQuery, callback_data: Buy, db: Database, service: VpnService, user: User) -> None:
-    """Шаг 3: реквизиты для оплаты."""
-    plan = await db.get_plan(callback_data.plan_id)
-    if plan is None or not plan.active:
-        await call.answer("Тариф недоступен", show_alert=True)
-        return
-    server = await db.get_server(callback_data.sid) if callback_data.sid else None
-    if callback_data.sid and (server is None or server.id not in {s.id for s in await service.available_servers()}):
-        await call.answer("Этот сервер сейчас недоступен, выберите другой", show_alert=True)
         return
     await call.answer()
     s = service.settings
     price = await service.price_for(user, plan)
     note = f" <s>{plan.price} {s.currency}</s> — скидка новичка" if price < plan.price else ""
-    where = f"Сервер: {esc(server.title)} ({', '.join(PROTOCOLS[p] for p in server.protocol_list)})\n" if server else ""
     text = (
         f"<b>{esc(plan.title)}</b>\n"
         f"Срок: {days_word(plan.days)}, {devices_word(plan.devices)}\n"
-        f"{where}"
         f"К оплате: <b>{price} {s.currency}</b>{note}\n\n"
         f"{s.payment_details}\n\n"
         "После оплаты нажмите «✅ Я оплатил» и отправьте скриншот или чек."
     )
-    back_to = Buy(action="plan", plan_id=plan.id) if len(await service.available_servers()) > 1 else Menu(action="plans")
     await edit_or_send(
         call,
         text,
-        ikb(
-            [
-                [("✅ Я оплатил", Buy(action="paid", plan_id=plan.id, sid=callback_data.sid).pack())],
-                [back(back_to)],
-            ]
-        ),
+        ikb([[("✅ Я оплатил", Buy(action="paid", plan_id=plan.id).pack())], [back(Menu(action="plans"))]]),
     )
 
 

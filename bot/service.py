@@ -560,13 +560,6 @@ class VpnService:
     async def set_user_server(self, tg_id: int, server_id: int | None) -> None:
         await self.db.update_user(tg_id, server_id=server_id)
 
-    async def user_server(self, user: User) -> Server | None:
-        """Сервер, выбранный при покупке, если он ещё доступен."""
-        if not user.server_id:
-            return None
-        row = await self.db.get_server(user.server_id)
-        return row if row and row.active and row.status_ok and row.protocol_list else None
-
     # ---------- подписка ----------
 
     async def extend(self, tg_id: int, days: int, devices: int | None = None) -> User:
