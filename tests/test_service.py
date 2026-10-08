@@ -570,7 +570,7 @@ async def test_multi_vless_move_and_preferred_server(multi):
     p = await multi.db.create_payment(10, plan, "text", "чек", server_id=nl.id)
     await multi.confirm_payment(p.id, ADMIN)
     user = await multi.db.get_user(10)
-    assert user.server_id == nl.id and (await multi.user_server(user)).id == nl.id
+    assert user.server_id == nl.id
 
     rk = await multi.create_device(user, "Ноутбук", nl.id, "vless")
     moved = await multi.move_device(rk.key, de.id)

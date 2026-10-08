@@ -28,7 +28,7 @@ class Dev(CallbackData, prefix="d"):
 class Loc(CallbackData, prefix="loc"):
     """Выбор локации: new — для нового устройства, pick/move — перенос устройства `key`."""
 
-    action: str  # new | pick | move | home (сервер по умолчанию в профиле)
+    action: str  # new | pick | move
     key: int = 0
     sid: int = 0
 
