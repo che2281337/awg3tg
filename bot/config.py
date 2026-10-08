@@ -16,9 +16,9 @@ def _int(name: str, default: int) -> int:
 
 
 def _remind_days(value: str) -> tuple[int, ...]:
-    """«7,3,2,1» → (7, 3, 2, 1); пусто — по умолчанию, «0» — без напоминаний."""
+    """«5,3,1» → (5, 3, 1); пусто — по умолчанию, «0» — без напоминаний."""
     if not value.strip():
-        return (7, 3, 2, 1)
+        return (3, 2, 1)
     days = {int(x) for x in value.replace(" ", "").split(",") if x.isdigit()}
     return tuple(sorted((d for d in days if 0 < d <= 365), reverse=True))
 
@@ -73,7 +73,7 @@ class Settings:
     manual_payments: bool = True
 
     # За сколько дней до конца подписки напоминать (каждый порог — одно сообщение)
-    remind_days: tuple[int, ...] = (7, 3, 2, 1)
+    remind_days: tuple[int, ...] = (3, 2, 1)
 
     # Фоновые задачи
     stats_interval: int = 300
