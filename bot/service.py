@@ -20,6 +20,7 @@ from .awg.xray import XrayServer, build_vless_url, new_client_id
 from .config import Settings
 from .db import PROTOCOLS, Database, Key, Payment, Plan, Server, User, now
 from .utils import today
+from .yoomoney import Operation, YooMoney, YooMoneyError, quickpay_url
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +77,19 @@ class PaymentResult:
     payment: Payment
     user: User
     referrer: User | None = None
+
+
+@dataclass
+class AutoPayment:
+    """Результат проверки счёта ЮMoney: оплачен (result) или ушёл админу на проверку (review)."""
+
+    payment: Payment
+    result: PaymentResult | None = None
+    review: bool = False
+
+
+# Сколько живёт неоплаченный счёт ЮMoney (потом создаётся новый)
+INVOICE_TTL = 24 * 3600
 
 
 @dataclass
@@ -166,10 +180,14 @@ class VpnService:
         self.db = db
         self.pool = ServerPool(settings, local)
         self._lock = asyncio.Lock()
+        self._pay_lock = asyncio.Lock()
+        self.yoomoney: YooMoney | None = YooMoney(settings.yoomoney_token) if settings.yoomoney_token else None
+        self.yoomoney_wallet = settings.yoomoney_wallet
 
     # ---------- запуск ----------
 
     async def start(self) -> None:
+        await self._init_yoomoney()
         servers = await self.db.servers()
         if not servers:
             await self._bootstrap_servers()
@@ -569,7 +587,7 @@ class VpnService:
         if not -MAX_DAYS <= days <= MAX_DAYS:
             raise ServiceError(f"Срок должен быть от -{MAX_DAYS} до {MAX_DAYS} дней.")
         base = max(now(), user.sub_until or 0)
-        fields: dict = {"sub_until": clamp_ts(base + days * 86400), "notified": 0}
+        fields: dict = {"sub_until": clamp_ts(base + days * 86400), "notified": 0, "reminded": None}
         if devices is not None:
             fields["device_limit"] = max(0, min(devices, MAX_DEVICES))
         elif not user.device_limit:
@@ -581,7 +599,9 @@ class VpnService:
         return user
 
     async def set_sub_until(self, tg_id: int, until: int | None) -> None:
-        await self.db.update_user(tg_id, sub_until=None if until is None else clamp_ts(until), notified=0)
+        await self.db.update_user(
+            tg_id, sub_until=None if until is None else clamp_ts(until), notified=0, reminded=None
+        )
         await self.sync_user(tg_id)
 
     async def set_device_limit(self, tg_id: int, limit: int) -> None:
@@ -646,8 +666,11 @@ class VpnService:
 
     # ---------- оплата ----------
 
-    async def confirm_payment(self, payment_id: int, admin_id: int) -> PaymentResult:
-        if not await self.db.decide_payment(payment_id, "paid", admin_id):
+    async def confirm_payment(
+        self, payment_id: int, admin_id: int, from_status: tuple[str, ...] = ("pending",)
+    ) -> PaymentResult:
+        """admin_id = 0 — подтверждено автоматически (ЮMoney)."""
+        if not await self.db.decide_payment(payment_id, "paid", admin_id, from_status):
             raise ServiceError("Платёж уже обработан.")
         payment = await self.db.get_payment(payment_id)
         assert payment
@@ -670,6 +693,108 @@ class VpnService:
             if await self.db.get_user(user.referrer_id):
                 referrer = await self.extend(user.referrer_id, self.settings.ref_bonus_days)
         return PaymentResult(payment, user, referrer)
+
+    # ---------- автооплата ЮMoney ----------
+
+    async def _init_yoomoney(self) -> None:
+        if self.yoomoney is None or self.yoomoney_wallet:
+            return
+        try:
+            self.yoomoney_wallet = await self.yoomoney.account()
+            log.info("ЮMoney: кошелёк %s", self.yoomoney_wallet)
+        except YooMoneyError as e:
+            log.error("ЮMoney: не удалось узнать номер кошелька (%s) — задайте YOOMONEY_WALLET в .env", e)
+
+    @property
+    def autopay(self) -> bool:
+        return self.yoomoney is not None and bool(self.yoomoney_wallet)
+
+    async def plan_invoice(self, user: User, plan: Plan) -> Payment:
+        price = await self.price_for(user, plan)
+        title = plan.title + (" (скидка новичка)" if price < plan.price else "")
+        return await self.db.invoice(
+            user.tg_id,
+            kind="plan",
+            plan_id=plan.id,
+            title=title,
+            days=plan.days,
+            devices=plan.devices,
+            amount=price,
+            fresh_after=now() - INVOICE_TTL // 2,
+        )
+
+    async def slot_invoice(self, user: User, slot_id: int | None) -> Payment:
+        s = self.settings
+        title = "Продление доп. слота устройства" if slot_id else "Доп. слот устройства"
+        return await self.db.invoice(
+            user.tg_id,
+            kind="slot",
+            slot_id=slot_id,
+            title=title,
+            days=s.slot_days,
+            devices=1,
+            amount=s.slot_price,
+            fresh_after=now() - INVOICE_TTL // 2,
+        )
+
+    def pay_url(self, payment: Payment, success_url: str = "") -> str:
+        assert payment.label
+        return quickpay_url(
+            self.yoomoney_wallet,
+            payment.amount,
+            payment.label,
+            f"{self.settings.server_name}: {payment.title}"[:150],
+            self.settings.yoomoney_payment_type,
+            success_url,
+        )
+
+    def _enough(self, payment: Payment, op: Operation) -> bool:
+        need = payment.amount * (100 - self.settings.yoomoney_fee_percent) / 100
+        return op.amount + 0.005 >= need
+
+    async def check_invoices(self, payment: Payment | None = None) -> list[AutoPayment]:
+        """Ищет оплаты счетов в истории кошелька. payment — проверить только этот счёт (кнопка клиента)."""
+        if self.yoomoney is None:
+            return []
+        async with self._pay_lock:
+            if payment is None:
+                await self.db.expire_invoices(now() - INVOICE_TTL)
+                if not await self.db.open_invoices(now() - INVOICE_TTL):
+                    return []
+                ops = await self.yoomoney.operations()
+            else:
+                if not payment.label:
+                    return []
+                ops = await self.yoomoney.operations(label=payment.label, records=10)
+            done = []
+            for op in ops:
+                if op.direction != "in" or op.status != "success" or not op.label:
+                    continue
+                # Просроченный счёт тоже засчитываем: клиент мог оплатить по старой ссылке.
+                p = await self.db.payment_by_label(op.label)
+                if p is None or p.status not in ("invoice", "expired"):
+                    continue
+                if not await self.db.claim_operation(p.id, op.operation_id, op.amount):
+                    continue
+                if not self._enough(p, op):
+                    await self.db.set_payment_review(
+                        p.id,
+                        f"ЮMoney: зачислено {op.amount:.2f} {self.settings.currency} вместо {p.amount} "
+                        f"(операция {op.operation_id}). Проверьте и подтвердите вручную.",
+                    )
+                    reviewed = await self.db.get_payment(p.id)
+                    assert reviewed
+                    done.append(AutoPayment(reviewed, review=True))
+                    log.warning("ЮMoney: счёт №%s оплачен не полностью (%s из %s)", p.id, op.amount, p.amount)
+                    continue
+                try:
+                    result = await self.confirm_payment(p.id, 0, from_status=("invoice", "expired"))
+                except ServiceError as e:  # например, аккаунт удалили, пока он платил
+                    log.error("ЮMoney: счёт №%s оплачен, но не активирован: %s", p.id, e)
+                    continue
+                log.info("ЮMoney: счёт №%s оплачен (%s), операция %s", p.id, op.amount, op.operation_id)
+                done.append(AutoPayment(result.payment, result=result))
+            return done
 
     async def reject_payment(self, payment_id: int, admin_id: int) -> Payment:
         if not await self.db.decide_payment(payment_id, "rejected", admin_id):
@@ -730,6 +855,8 @@ class VpnService:
 
     async def close(self) -> None:
         await self.pool.close()
+        if self.yoomoney:
+            await self.yoomoney.close()
 
 
 def detect_public_ip() -> str:

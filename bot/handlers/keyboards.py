@@ -49,13 +49,20 @@ class AMove(CallbackData, prefix="amv"):
 
 
 class Buy(CallbackData, prefix="buy"):
-    action: str  # plan | srv | paid
+    action: str  # plan | srv (старые кнопки) | manual — перевод по реквизитам | paid — «Я оплатил»
     plan_id: int
-    sid: int = 0  # сервер, выбранный при покупке
+    sid: int = 0  # сервер, выбранный при покупке (старые кнопки)
+
+
+class PayCheck(CallbackData, prefix="pc"):
+    """«Проверить оплату» счёта ЮMoney."""
+
+    id: int
 
 
 class SlotCb(CallbackData, prefix="sl"):
-    """Доп. слот устройства: buy — купить новый, renew — продлить слот id, paid — «Я оплатил»."""
+    """Доп. слот устройства: buy — купить новый, renew — продлить слот id,
+    manual — перевод по реквизитам, paid — «Я оплатил»."""
 
     action: str
     id: int = 0
@@ -139,11 +146,15 @@ def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
+def _button(text: str, data: str) -> InlineKeyboardButton:
+    if data.startswith("https://"):
+        return InlineKeyboardButton(text=text, url=data)
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
 def ikb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
-    """Inline-клавиатура из [(текст, callback_data)]."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows if row]
-    )
+    """Inline-клавиатура из [(текст, callback_data или https-ссылка)]."""
+    return InlineKeyboardMarkup(inline_keyboard=[[_button(t, d) for t, d in row] for row in rows if row])
 
 
 def slot_kb(slot_id: int, price: int, currency: str) -> InlineKeyboardMarkup:

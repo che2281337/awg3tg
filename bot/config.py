@@ -15,6 +15,14 @@ def _int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+def _remind_days(value: str) -> tuple[int, ...]:
+    """«5,3,1» → (5, 3, 1); пусто — по умолчанию, «0» — без напоминаний."""
+    if not value.strip():
+        return (3, 2, 1)
+    days = {int(x) for x in value.replace(" ", "").split(",") if x.isdigit()}
+    return tuple(sorted((d for d in days if 0 < d <= 365), reverse=True))
+
+
 @dataclass
 class Settings:
     bot_token: str
@@ -51,6 +59,21 @@ class Settings:
     # Дополнительный слот устройства сверх тарифа: цена и срок действия
     slot_price: int = 100
     slot_days: int = 30
+
+    # Автооплата картой через кошелёк ЮMoney (пустой токен — выключено)
+    yoomoney_token: str = ""
+    yoomoney_wallet: str = ""  # номер кошелька; пусто — бот узнает его по токену
+    yoomoney_payment_type: str = "AC"  # AC — банковской картой, PC — из кошелька ЮMoney
+    # Комиссия ЮMoney списывается с получателя: платёж засчитывается, если зачислено
+    # не меньше (100 - YOOMONEY_FEE_PERCENT)% цены. Иначе он уходит админу на ручную проверку.
+    yoomoney_fee_percent: int = 5
+    yoomoney_check_interval: int = 30
+    # Показывать ли перевод по реквизитам с проверкой админом (при включённой ЮMoney —
+    # только если задан PAYMENT_DETAILS)
+    manual_payments: bool = True
+
+    # За сколько дней до конца подписки напоминать (каждый порог — одно сообщение)
+    remind_days: tuple[int, ...] = (3, 2, 1)
 
     # Фоновые задачи
     stats_interval: int = 300
@@ -93,7 +116,14 @@ class Settings:
             default_devices=_int("DEFAULT_DEVICES", 1),
             slot_price=max(0, _int("SLOT_PRICE", 100)),
             slot_days=max(1, min(_int("SLOT_DAYS", 30), 3650)),
+            remind_days=_remind_days(os.getenv("REMIND_DAYS", "")),
             stats_interval=max(60, _int("STATS_INTERVAL", 300)),
             backup_hours=max(0, _int("BACKUP_HOURS", 24)),
+            yoomoney_token=os.getenv("YOOMONEY_TOKEN", "").strip(),
+            yoomoney_wallet=os.getenv("YOOMONEY_WALLET", "").strip(),
+            yoomoney_payment_type=(os.getenv("YOOMONEY_PAYMENT_TYPE", "AC").strip().upper() or "AC"),
+            yoomoney_fee_percent=max(0, min(50, _int("YOOMONEY_FEE_PERCENT", 5))),
+            yoomoney_check_interval=max(10, _int("YOOMONEY_CHECK_INTERVAL", 30)),
+            manual_payments=bool(details) or not os.getenv("YOOMONEY_TOKEN", "").strip(),
             awg_mock=os.getenv("AWG_MOCK", "").strip().lower() in ("1", "true", "yes", "on"),
         )

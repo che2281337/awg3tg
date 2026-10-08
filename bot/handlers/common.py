@@ -9,8 +9,8 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message, TelegramObject
 
 from ..db import Database
-from ..service import RenderedKey, VpnService
-from ..utils import esc
+from ..service import PaymentResult, RenderedKey, VpnService
+from ..utils import days_word, devices_word, esc, fmt_dt
 
 log = logging.getLogger(__name__)
 
@@ -22,8 +22,9 @@ def help_text(support: str) -> str:
         "<b>Как подключиться</b>\n\n"
         "1. Установите <b>AmneziaVPN</b> 5.0.1.5 или новее: https://amnezia.org/downloads "
         "(или из App Store / Google Play).\n"
-        "2. Оформите подписку в разделе «💳 Тарифы» и выберите сервер (страну).\n"
-        "3. В «🔑 Мои устройства» добавьте устройство: выберите протокол и введите название — придёт ключ и QR-код.\n"
+        "2. Оформите подписку в разделе «💳 Тарифы».\n"
+        "3. В «🔑 Мои устройства» добавьте устройство: выберите сервер (страну), протокол и введите название — "
+        "придёт ключ и QR-код.\n"
         "4. В AmneziaVPN: <b>«Добавить сервер» → «Вставить ключ»</b> (или «Файл с настройками» / «QR-код»).\n"
         "5. Подключитесь.\n\n"
         "<b>Какой протокол выбрать?</b>\n"
@@ -163,3 +164,46 @@ async def notify_admins(bot: Bot, service: VpnService, text: str, **kwargs) -> N
             await bot.send_message(admin_id, text, **kwargs)
         except Exception:
             log.warning("Не удалось уведомить админа %s", admin_id)
+
+
+async def _send(bot: Bot, chat_id: int, text: str) -> None:
+    try:
+        await bot.send_message(chat_id, text)
+    except Exception:
+        log.info("Не удалось отправить сообщение %s", chat_id)
+
+
+async def notify_payment_confirmed(bot: Bot, service: VpnService, res: PaymentResult, auto: bool = False) -> None:
+    """Сообщения клиенту (и пригласившему) после подтверждения оплаты; при автооплате — ещё и админам."""
+    p, u = res.payment, res.user
+    limit = await service.device_limit(u)
+    head = "✅ Оплата получена!" if auto else f"✅ Оплата №{p.id} подтверждена!"
+    if p.kind == "slot":
+        text = (
+            f"{head} Дополнительный слот добавлен на {days_word(p.days)} — "
+            f"теперь доступно {devices_word(limit)}.\n\nДобавьте устройство в «🔑 Мои устройства»."
+        )
+    else:
+        text = (
+            f"{head}\nПодписка активна до <b>{fmt_dt(u.sub_until)}</b>, "
+            f"доступно {devices_word(limit)}.\n\nДобавьте устройства в «🔑 Мои устройства»."
+        )
+    await _send(bot, u.tg_id, text)
+    if res.referrer:
+        await _send(
+            bot,
+            res.referrer.tg_id,
+            f"🎁 Ваш друг оплатил подписку — вам начислено +{days_word(service.settings.ref_bonus_days)}. "
+            f"Подписка до {fmt_dt(res.referrer.sub_until)}.",
+        )
+    if auto:
+        what = f"до {fmt_dt(u.sub_until)}" if p.kind == "plan" else f"устройств: {limit}"
+        paid = f"{p.paid_amount:.2f}".rstrip("0").rstrip(".") if p.paid_amount is not None else str(p.amount)
+        await notify_admins(
+            bot,
+            service,
+            f"💰 <b>Автооплата №{p.id}</b> (ЮMoney)\n"
+            f"{esc(u.title)} (<code>{u.tg_id}</code>)\n"
+            f"{esc(p.title)} — {p.amount} {service.settings.currency} (зачислено {paid}), {what}",
+            disable_notification=True,
+        )

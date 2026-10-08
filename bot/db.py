@@ -8,6 +8,8 @@ data/ — его достаточно копировать для резервн
 from __future__ import annotations
 
 import os
+import secrets
+import sqlite3
 import time
 from dataclasses import dataclass
 
@@ -84,7 +86,7 @@ CREATE TABLE IF NOT EXISTS payments (
     days         INTEGER NOT NULL,
     devices      INTEGER NOT NULL,
     amount       INTEGER NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'pending',  -- pending | paid | rejected
+    status       TEXT NOT NULL DEFAULT 'pending',  -- invoice | pending | paid | rejected | expired
     receipt_type TEXT,                              -- photo | document | text
     receipt      TEXT,                              -- file_id или текст
     created_at   INTEGER NOT NULL,
@@ -122,6 +124,7 @@ _MIGRATIONS = {
         "notified": "INTEGER NOT NULL DEFAULT 0",
         "ref_rewarded": "INTEGER NOT NULL DEFAULT 0",
         "server_id": "INTEGER",  # сервер, выбранный при покупке тарифа (для новых устройств)
+        "reminded": "INTEGER",  # за сколько дней до конца подписки уже напомнили (NULL — ещё нет)
     },
     "keys": {
         "enabled": "INTEGER NOT NULL DEFAULT 1",
@@ -142,6 +145,11 @@ _MIGRATIONS = {
         "server_id": "INTEGER",
         "kind": "TEXT NOT NULL DEFAULT 'plan'",  # plan | slot
         "slot_id": "INTEGER",  # для продления конкретного доп. слота
+        # manual — чек проверяет админ; yoomoney — счёт ЮMoney (status invoice, пока не оплачен)
+        "method": "TEXT NOT NULL DEFAULT 'manual'",
+        "label": "TEXT",  # метка платежа в ЮMoney
+        "operation_id": "TEXT",  # операция ЮMoney, которой оплачен счёт
+        "paid_amount": "REAL",  # сколько зачислено на кошелёк
     },
 }
 
@@ -151,6 +159,8 @@ PROTOCOLS = {"awg": "AmneziaWG", "vless": "VLESS"}
 POST_MIGRATION = """
 CREATE INDEX IF NOT EXISTS keys_server ON keys(server_id);
 CREATE INDEX IF NOT EXISTS traffic_server_day ON traffic_daily(server_id, day);
+CREATE UNIQUE INDEX IF NOT EXISTS payments_label ON payments(label);
+CREATE UNIQUE INDEX IF NOT EXISTS payments_operation ON payments(operation_id);
 """
 
 
@@ -173,6 +183,7 @@ class User:
     notified: int
     ref_rewarded: int
     server_id: int | None
+    reminded: int | None
 
     @property
     def title(self) -> str:
@@ -258,6 +269,10 @@ class Payment:
     server_id: int | None
     kind: str
     slot_id: int | None
+    method: str
+    label: str | None
+    operation_id: str | None
+    paid_amount: float | None
 
 
 @dataclass
@@ -746,14 +761,86 @@ class Database:
     async def get_payment(self, payment_id: int) -> Payment | None:
         return await self._one(Payment, "SELECT * FROM payments WHERE id = ?", (payment_id,))
 
-    async def decide_payment(self, payment_id: int, status: str, admin_id: int) -> bool:
+    async def decide_payment(
+        self, payment_id: int, status: str, admin_id: int, from_status: tuple[str, ...] = ("pending",)
+    ) -> bool:
         """Атомарно меняет статус pending -> paid/rejected (защита от двойного нажатия)."""
+        marks = ",".join("?" * len(from_status))
         return (
             await self._exec(
-                "UPDATE payments SET status = ?, decided_at = ?, admin_id = ? WHERE id = ? AND status = 'pending'",
-                (status, now(), admin_id, payment_id),
+                f"UPDATE payments SET status = ?, decided_at = ?, admin_id = ? WHERE id = ? AND status IN ({marks})",
+                (status, now(), admin_id, payment_id, *from_status),
             )
             > 0
+        )
+
+    # ---------- счета ЮMoney ----------
+
+    async def invoice(
+        self,
+        tg_id: int,
+        *,
+        kind: str,
+        title: str,
+        days: int,
+        devices: int,
+        amount: int,
+        plan_id: int | None = None,
+        slot_id: int | None = None,
+        fresh_after: int = 0,
+    ) -> Payment:
+        """Неоплаченный счёт на эту покупку (существующий, если он создан после fresh_after, иначе новый)."""
+        existing = await self._one(
+            Payment,
+            """SELECT * FROM payments WHERE tg_id = ? AND status = 'invoice' AND kind = ? AND amount = ?
+               AND plan_id IS ? AND slot_id IS ? AND created_at > ? ORDER BY id DESC LIMIT 1""",
+            (tg_id, kind, amount, plan_id, slot_id, fresh_after),
+        )
+        if existing:
+            return existing
+        cur = await self.c.execute(
+            """INSERT INTO payments (tg_id, plan_id, title, days, devices, amount, status, created_at,
+                                     kind, slot_id, method, label)
+               VALUES (?, ?, ?, ?, ?, ?, 'invoice', ?, ?, ?, 'yoomoney', ?)""",
+            (tg_id, plan_id, title, days, devices, amount, now(), kind, slot_id, secrets.token_hex(12)),
+        )
+        await self.c.commit()
+        p = await self.get_payment(cur.lastrowid)
+        assert p
+        return p
+
+    async def open_invoices(self, since: int) -> list[Payment]:
+        return await self._all(
+            Payment, "SELECT * FROM payments WHERE status = 'invoice' AND created_at > ? ORDER BY id", (since,)
+        )
+
+    async def payment_by_label(self, label: str) -> Payment | None:
+        return await self._one(Payment, "SELECT * FROM payments WHERE label = ?", (label,))
+
+    async def expire_invoices(self, before: int) -> int:
+        return await self._exec(
+            "UPDATE payments SET status = 'expired' WHERE status = 'invoice' AND created_at <= ?", (before,)
+        )
+
+    async def claim_operation(self, payment_id: int, operation_id: str, amount: float) -> bool:
+        """Привязывает операцию ЮMoney к счёту. False — счёт уже оплачен или операция уже учтена."""
+        try:
+            return (
+                await self._exec(
+                    """UPDATE payments SET operation_id = ?, paid_amount = ?
+                       WHERE id = ? AND operation_id IS NULL AND status IN ('invoice', 'expired')""",
+                    (operation_id, amount, payment_id),
+                )
+                > 0
+            )
+        except sqlite3.IntegrityError:  # эта операция уже привязана к другому счёту
+            return False
+
+    async def set_payment_review(self, payment_id: int, note: str) -> None:
+        """Счёт оплачен не полностью — на ручную проверку админом."""
+        await self._exec(
+            "UPDATE payments SET status = 'pending', receipt_type = 'text', receipt = ? WHERE id = ?",
+            (note, payment_id),
         )
 
     async def pending_payments(self) -> list[Payment]:
@@ -764,7 +851,9 @@ class Database:
 
     async def user_payments(self, tg_id: int, limit: int = 10) -> list[Payment]:
         return await self._all(
-            Payment, "SELECT * FROM payments WHERE tg_id = ? ORDER BY id DESC LIMIT ?", (tg_id, limit)
+            Payment,
+            "SELECT * FROM payments WHERE tg_id = ? AND status NOT IN ('invoice', 'expired') ORDER BY id DESC LIMIT ?",
+            (tg_id, limit),
         )
 
     async def has_paid(self, tg_id: int) -> bool:
