@@ -240,24 +240,46 @@ async def test_reminders_and_expiry_notifications(svc, fake_container):
     await svc.extend(10, 30)
     rk = await new_device(svc, user, "📱 Телефон")
 
-    await svc.db.update_user(10, sub_until=now() + 2 * 86400)
     await check_subscriptions(bot, svc)
-    await check_subscriptions(bot, svc)  # повторно не напоминает
-    assert len(bot.sent) == 1 and "заканчивается" in bot.sent[0][1]
+    assert bot.sent == []  # до конца 30 дней — рано
 
-    await svc.db.update_user(10, sub_until=now() + 3600)
-    await check_subscriptions(bot, svc)
-    assert len(bot.sent) == 2
+    # за неделю, потом за 3, 2 и 1 день — по одному сообщению на каждый порог
+    for days_left, n in ((6.9, 1), (6.5, 1), (2.9, 2), (1.9, 3), (1.5, 3), (0.5, 4)):
+        await svc.db.update_user(10, sub_until=now() + int(days_left * 86400))
+        await check_subscriptions(bot, svc)
+        await check_subscriptions(bot, svc)  # повторно не напоминает
+        assert len(bot.sent) == n, days_left
+    assert "7 дней" in bot.sent[0][1] and "3 дня" in bot.sent[1][1] and "2 дня" in bot.sent[2][1]
+    assert "меньше чем через сутки" in bot.sent[3][1]
 
     await svc.db.update_user(10, sub_until=now() - 1)
     await check_subscriptions(bot, svc)
     await check_subscriptions(bot, svc)
-    assert len(bot.sent) == 3 and "закончилась" in bot.sent[2][1]
+    assert len(bot.sent) == 5 and "закончилась" in bot.sent[4][1]
     assert rk.key.public_key not in server_conf(fake_container)
 
     # после продления напоминания снова работают
     await svc.extend(10, 1)
-    assert (await svc.db.get_user(10)).notified == 0
+    u = await svc.db.get_user(10)
+    assert u.notified == 0 and u.reminded is None
+    await check_subscriptions(bot, svc)
+    assert len(bot.sent) == 6 and "меньше чем через сутки" in bot.sent[5][1]
+
+
+async def test_short_purchase_gets_only_nearest_reminder(svc):
+    from bot.config import _remind_days
+    from bot.scheduler import check_subscriptions, remind_threshold
+
+    assert _remind_days("") == (7, 3, 2, 1) and _remind_days("1, 5,x,0,5") == (5, 1) and _remind_days("0") == ()
+    assert remind_threshold(8 * 86400, (7, 3, 2, 1)) is None
+    assert remind_threshold(5 * 86400, (7, 3, 2, 1)) == 7
+    assert remind_threshold(3 * 86400, (7, 3, 2, 1)) == 3
+
+    bot = FakeBot()
+    await svc.db.touch_user(10, "u10", "User")
+    await svc.extend(10, 2)  # купили 2 дня — не засыпаем напоминаниями за 7 и 3 дня
+    await check_subscriptions(bot, svc)
+    assert len(bot.sent) == 1 and "2 дня" in bot.sent[0][1]
 
 
 async def test_huge_values_are_rejected_or_clamped(svc):

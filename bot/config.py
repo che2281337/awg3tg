@@ -15,6 +15,14 @@ def _int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+def _remind_days(value: str) -> tuple[int, ...]:
+    """«7,3,2,1» → (7, 3, 2, 1); пусто — по умолчанию, «0» — без напоминаний."""
+    if not value.strip():
+        return (7, 3, 2, 1)
+    days = {int(x) for x in value.replace(" ", "").split(",") if x.isdigit()}
+    return tuple(sorted((d for d in days if 0 < d <= 365), reverse=True))
+
+
 @dataclass
 class Settings:
     bot_token: str
@@ -64,6 +72,9 @@ class Settings:
     # только если задан PAYMENT_DETAILS)
     manual_payments: bool = True
 
+    # За сколько дней до конца подписки напоминать (каждый порог — одно сообщение)
+    remind_days: tuple[int, ...] = (7, 3, 2, 1)
+
     # Фоновые задачи
     stats_interval: int = 300
     # Резервная копия базы админам в Telegram раз в N часов (0 — выключить)
@@ -105,6 +116,7 @@ class Settings:
             default_devices=_int("DEFAULT_DEVICES", 1),
             slot_price=max(0, _int("SLOT_PRICE", 100)),
             slot_days=max(1, min(_int("SLOT_DAYS", 30), 3650)),
+            remind_days=_remind_days(os.getenv("REMIND_DAYS", "")),
             stats_interval=max(60, _int("STATS_INTERVAL", 300)),
             backup_hours=max(0, _int("BACKUP_HOURS", 24)),
             yoomoney_token=os.getenv("YOOMONEY_TOKEN", "").strip(),

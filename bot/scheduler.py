@@ -23,9 +23,7 @@ from .yoomoney import YooMoneyError
 
 log = logging.getLogger(__name__)
 
-# Этапы users.notified
-STAGE_3_DAYS = 1
-STAGE_1_DAY = 2
+# users.notified: 3 — сообщили об окончании подписки (напоминания до конца — в users.reminded)
 STAGE_EXPIRED = 3
 
 
@@ -72,18 +70,39 @@ async def check_subscriptions(bot: Bot, service: VpnService) -> None:
             reply_markup=ikb([[(f"➕ Купить слот — {s.slot_price} {s.currency}", SlotCb(action="buy").pack())]]),
         )
 
-    for days, stage in ((1, STAGE_1_DAY), (3, STAGE_3_DAYS)):
-        for user in await db.users_expiring(now() + days * 86400):
-            if user.notified >= stage:
-                continue
-            await db.update_user(user.tg_id, notified=stage)
-            await _safe_send(
-                bot,
-                user.tg_id,
-                f"⏰ Подписка заканчивается {fmt_dt(user.sub_until)} ({left_str(user.sub_until, now())}).\n"
-                "Продлите её заранее, чтобы VPN не отключился.",
-                reply_markup=renew_kb(),
-            )
+    await remind_expiring(bot, service)
+
+
+def remind_threshold(left: int, remind_days: tuple[int, ...]) -> int | None:
+    """Самый близкий порог напоминания (в днях), в который уже попал остаток подписки."""
+    hit = [d for d in remind_days if left <= d * 86400]
+    return min(hit) if hit else None
+
+
+async def remind_expiring(bot: Bot, service: VpnService) -> None:
+    """Напоминания до конца подписки: по умолчанию за 7, 3, 2 и 1 день (REMIND_DAYS)."""
+    days = service.settings.remind_days
+    if not days:
+        return
+    t = now()
+    for user in await service.db.users_expiring(t + max(days) * 86400):
+        threshold = remind_threshold(user.sub_until - t, days)
+        if threshold is None or (user.reminded is not None and user.reminded <= threshold):
+            continue
+        await service.db.update_user(user.tg_id, reminded=threshold)
+        if service.is_admin(user.tg_id):
+            continue
+        left = left_str(user.sub_until, t)
+        if threshold <= 1:
+            head = f"⚠️ <b>Подписка заканчивается меньше чем через сутки</b> — {fmt_dt(user.sub_until)} ({left})."
+        else:
+            head = f"⏰ Подписка заканчивается {fmt_dt(user.sub_until)} ({left})."
+        await _safe_send(
+            bot,
+            user.tg_id,
+            head + "\nПродлите её заранее, чтобы VPN не отключился — новый срок добавится к текущему.",
+            reply_markup=renew_kb(),
+        )
 
 
 async def check_servers(bot: Bot, service: VpnService) -> None:

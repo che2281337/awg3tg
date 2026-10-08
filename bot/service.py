@@ -587,7 +587,7 @@ class VpnService:
         if not -MAX_DAYS <= days <= MAX_DAYS:
             raise ServiceError(f"Срок должен быть от -{MAX_DAYS} до {MAX_DAYS} дней.")
         base = max(now(), user.sub_until or 0)
-        fields: dict = {"sub_until": clamp_ts(base + days * 86400), "notified": 0}
+        fields: dict = {"sub_until": clamp_ts(base + days * 86400), "notified": 0, "reminded": None}
         if devices is not None:
             fields["device_limit"] = max(0, min(devices, MAX_DEVICES))
         elif not user.device_limit:
@@ -599,7 +599,9 @@ class VpnService:
         return user
 
     async def set_sub_until(self, tg_id: int, until: int | None) -> None:
-        await self.db.update_user(tg_id, sub_until=None if until is None else clamp_ts(until), notified=0)
+        await self.db.update_user(
+            tg_id, sub_until=None if until is None else clamp_ts(until), notified=0, reminded=None
+        )
         await self.sync_user(tg_id)
 
     async def set_device_limit(self, tg_id: int, limit: int) -> None:

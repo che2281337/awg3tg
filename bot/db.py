@@ -124,6 +124,7 @@ _MIGRATIONS = {
         "notified": "INTEGER NOT NULL DEFAULT 0",
         "ref_rewarded": "INTEGER NOT NULL DEFAULT 0",
         "server_id": "INTEGER",  # сервер, выбранный при покупке тарифа (для новых устройств)
+        "reminded": "INTEGER",  # за сколько дней до конца подписки уже напомнили (NULL — ещё нет)
     },
     "keys": {
         "enabled": "INTEGER NOT NULL DEFAULT 1",
@@ -182,6 +183,7 @@ class User:
     notified: int
     ref_rewarded: int
     server_id: int | None
+    reminded: int | None
 
     @property
     def title(self) -> str:
