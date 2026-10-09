@@ -21,16 +21,19 @@ def help_text(support: str) -> str:
     text = (
         "<b>Как подключиться</b>\n\n"
         "1. Установите <b>AmneziaVPN</b> 5.0.1.5 или новее: https://amnezia.org/downloads "
-        "(или из App Store / Google Play).\n"
+        "(или из Google Play / App Store).\n"
+        "   📱 <b>iPhone в России:</b> в российском App Store AmneziaVPN нет — установите <b>DefaultVPN</b>, "
+        "это то же приложение, ключи вставляются так же.\n"
         "2. Оформите подписку в разделе «💳 Тарифы».\n"
         "3. В «🔑 Мои устройства» добавьте устройство: выберите сервер (страну), протокол и введите название — "
         "придёт ключ и QR-код.\n"
-        "4. В AmneziaVPN: <b>«Добавить сервер» → «Вставить ключ»</b> (или «Файл с настройками» / «QR-код»).\n"
+        "4. В AmneziaVPN (DefaultVPN): <b>«Добавить сервер» → «Вставить ключ»</b> "
+        "(или «Файл с настройками» / «QR-код»).\n"
         "5. Подключитесь.\n\n"
         "<b>Какой протокол выбрать?</b>\n"
-        "🛡 <b>AmneziaWG</b> — быстрый, работает в приложении AmneziaVPN.\n"
+        "🛡 <b>AmneziaWG</b> — быстрый, работает в приложении AmneziaVPN / DefaultVPN.\n"
         "⚡ <b>VLESS</b> — маскируется под обычный сайт, выручает, когда VPN блокируют. "
-        "Кроме AmneziaVPN, работает в v2rayNG, Hiddify, Streisand, FoXray.\n\n"
+        "Кроме AmneziaVPN / DefaultVPN, работает в v2rayNG, Hiddify, Streisand, FoXray.\n\n"
         "Один ключ — одно устройство. Для телефона и компьютера добавьте отдельные устройства.\n"
         "Если подписка закончилась, ключи отключаются, а после продления снова работают — "
         "заново ничего настраивать не нужно."
@@ -130,7 +133,7 @@ async def deliver_key(bot: Bot, chat_id: int, rk: RenderedKey) -> None:
             chat_id,
             header
             + "Скопируйте ссылку (нажмите на неё) и добавьте в приложение:\n"
-            "• <b>AmneziaVPN</b> — «Добавить сервер» → «Вставить ключ»;\n"
+            "• <b>AmneziaVPN</b> / <b>DefaultVPN</b> — «Добавить сервер» → «Вставить ключ»;\n"
             "• <b>v2rayNG</b> (Android) — ➕ → «Импорт из буфера обмена»;\n"
             "• <b>Hiddify</b>, <b>Streisand</b>, <b>FoXray</b> (iPhone) — ➕ → «Из буфера обмена».\n\n"
             f"<code>{esc(rk.vpn_url)}</code>",
@@ -139,7 +142,10 @@ async def deliver_key(bot: Bot, chat_id: int, rk: RenderedKey) -> None:
         if png:
             await bot.send_photo(chat_id, BufferedInputFile(png, filename="qr.png"), caption="QR-код для сканирования")
         return
-    instruction = "Скопируйте ключ (нажмите на него) и вставьте в AmneziaVPN → «Добавить сервер» → «Вставить ключ»:\n\n"
+    instruction = (
+        "Скопируйте ключ (нажмите на него) и вставьте в AmneziaVPN → «Добавить сервер» → «Вставить ключ».\n"
+        "📱 iPhone в России: вместо AmneziaVPN установите из App Store <b>DefaultVPN</b> — это то же приложение.\n\n"
+    )
     body = f"<code>{esc(rk.vpn_url)}</code>"
     if len(header) + len(instruction) + len(body) <= MAX_TEXT:
         await bot.send_message(chat_id, header + instruction + body)
@@ -151,7 +157,7 @@ async def deliver_key(bot: Bot, chat_id: int, rk: RenderedKey) -> None:
     await bot.send_document(
         chat_id,
         BufferedInputFile(rk.conf.encode(), filename=rk.filename),
-        caption="Файл конфигурации для AmneziaVPN / AmneziaWG",
+        caption="Файл конфигурации для AmneziaVPN / DefaultVPN",
     )
     png = rk.qr_png()
     if png:

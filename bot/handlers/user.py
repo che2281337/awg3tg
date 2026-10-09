@@ -263,9 +263,9 @@ async def _ask_protocol(call: CallbackQuery, state: FSMContext, server) -> None:
     await edit_or_send(
         call,
         f"Сервер: {esc(server.title)}\n\n🔐 <b>Выберите протокол</b>\n\n"
-        "🛡 <b>AmneziaWG</b> — быстрый, для приложения AmneziaVPN.\n"
+        "🛡 <b>AmneziaWG</b> — быстрый, для приложения AmneziaVPN (на iPhone в России — DefaultVPN).\n"
         "⚡ <b>VLESS</b> — маскируется под обычный HTTPS-сайт, хорошо работает там, где блокируют VPN. "
-        "Подходит для AmneziaVPN, v2rayNG, Hiddify, Streisand, FoXray.\n\n"
+        "Подходит для AmneziaVPN / DefaultVPN, v2rayNG, Hiddify, Streisand, FoXray.\n\n"
         "Если не уверены — начните с AmneziaWG, а при проблемах со связью добавьте VLESS.",
         ikb(rows),
     )

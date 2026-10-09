@@ -170,7 +170,7 @@ def back(cb: CallbackData | str, text: str = "⬅️ Назад") -> tuple[str, 
 
 
 PROTO_BUTTONS = {
-    "awg": "🛡 AmneziaWG — приложение AmneziaVPN",
-    "vless": "⚡ VLESS — AmneziaVPN, v2rayNG, Hiddify, Streisand",
+    "awg": "🛡 AmneziaWG — AmneziaVPN / DefaultVPN",
+    "vless": "⚡ VLESS — AmneziaVPN, DefaultVPN, Hiddify и др.",
 }
 PROTO_ICONS = {"awg": "🛡", "vless": "⚡"}
