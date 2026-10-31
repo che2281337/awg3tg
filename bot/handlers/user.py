@@ -385,9 +385,17 @@ async def cb_device_view(call: CallbackQuery, callback_data: Dev, db: Database, 
         f"Всего: {human_bytes(t_all.tx)} / {human_bytes(t_all.rx)}"
     )
     others = [s for s in await service.available_servers(key.protocol) if s.id != key.server_id]
+    whitelist = await service.whitelist_route(key) is not None
+    if whitelist:
+        text += (
+            "\n\n🛡 Если VPN не подключается из-за белых списков (мобильный интернет пускает только "
+            "разрешённые сайты) — возьмите <b>ключ для белых списков</b> и добавьте его в приложение "
+            "вторым подключением. Отдельное устройство на это не тратится."
+        )
     kb = ikb(
         [
             [("📤 Получить ключ", Dev(action="key", id=key.id).pack())],
+            [("🛡 Ключ для белых списков", Dev(action="wl", id=key.id).pack())] if whitelist else [],
             [("🌍 Сменить локацию", Loc(action="pick", key=key.id, sid=0).pack())] if others else [],
             [("✏️ Переименовать", Dev(action="ren", id=key.id).pack()), ("🗑 Удалить", Dev(action="del", id=key.id).pack())],
             [back(Menu(action="devices"))],
@@ -434,11 +442,16 @@ async def cb_move_device(
         log.exception("Ошибка переноса устройства")
         await call.message.answer("❌ Сервер не отвечает, попробуйте позже или выберите другую локацию.")
         return
-    await edit_or_send(call, f"✅ Устройство перенесено: {esc(rk.location)}. Добавьте новый ключ в приложение:")
+    note = ""
+    if await db.main_relay():
+        note = "\nКлюч для белых списков у перенесённого устройства тоже новый — возьмите его в карточке устройства."
+    await edit_or_send(
+        call, f"✅ Устройство перенесено: {esc(rk.location)}. Добавьте новый ключ в приложение:{note}"
+    )
     await deliver_key(bot, call.from_user.id, rk)
 
 
-@router.callback_query(Dev.filter(F.action == "key"))
+@router.callback_query(Dev.filter(F.action.in_({"key", "wl"})))
 async def cb_device_key(call: CallbackQuery, callback_data: Dev, bot: Bot, db: Database, service: VpnService, user: User) -> None:
     key = await _own_key(call, db, user, callback_data.id)
     if key is None:
@@ -448,7 +461,7 @@ async def cb_device_key(call: CallbackQuery, callback_data: Dev, bot: Bot, db: D
     else:
         await call.answer()
     try:
-        rk = await service.render(key)
+        rk = await service.render(key, whitelist=callback_data.action == "wl")
     except ServiceError as e:
         await bot.send_message(call.from_user.id, f"❌ {e}")
         return

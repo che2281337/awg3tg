@@ -4,21 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import io
+import ipaddress
 import logging
 import os
 import re
+import socket
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import segno
 
 from .awg.export import ClientParams, build_native_config, build_vpn_url
 from .awg.mock import MockAwgServer, MockXrayServer
+from .awg.relay import Forward, MockRelay, RelayClient, allocate_ports
 from .awg.runner import LocalRunner, Runner, SshKeyStore, SshRunner, parse_ssh_target
 from .awg.server import AwgError, AwgServer, ServerInfo
 from .awg.xray import XrayServer, build_vless_url, new_client_id
 from .config import Settings
-from .db import PROTOCOLS, Database, Key, Payment, Plan, Server, User, now
+from .db import PROTOCOLS, Database, Key, Payment, Plan, Relay, RelayPort, Server, User, now
 from .utils import today
 from .yoomoney import Operation, YooMoney, YooMoneyError, quickpay_url
 
@@ -50,6 +53,7 @@ class RenderedKey:
     conf: str  # .conf для AWG; для VLESS пусто
     server_name: str = "awg"
     location: str = ""
+    whitelist: bool = False  # ключ через входной сервер в РФ (для белых списков)
 
     @property
     def is_vless(self) -> bool:
@@ -59,6 +63,8 @@ class RenderedKey:
     def filename(self) -> str:
         # Имя туннеля в AmneziaWG берётся из имени файла: до 15 символов [A-Za-z0-9_=+.-]
         base = re.sub(r"[^A-Za-z0-9_=+.-]+", "", self.server_name)[:10] or "awg"
+        if self.whitelist:
+            base = base[:8] + "WL"
         return f"{base}_{self.key.id}.conf"
 
     def qr_png(self) -> bytes | None:
@@ -90,6 +96,18 @@ class AutoPayment:
 
 # Сколько живёт неоплаченный счёт ЮMoney (потом создаётся новый)
 INVOICE_TTL = 24 * 3600
+
+
+@dataclass
+class RelayCheck:
+    relay: Relay
+    ok: bool
+    changed: bool  # статус изменился с прошлой проверки
+    error: str = ""
+    applied: bool = False  # правила на входе были (пере)записаны
+
+
+WHITELIST_SUFFIX = "· белые списки"
 
 
 @dataclass
@@ -183,6 +201,8 @@ class VpnService:
         self._pay_lock = asyncio.Lock()
         self.yoomoney: YooMoney | None = YooMoney(settings.yoomoney_token) if settings.yoomoney_token else None
         self.yoomoney_wallet = settings.yoomoney_wallet
+        self._relay_clients: dict[int, RelayClient] = {}
+        self._relay_lock = asyncio.Lock()
 
     # ---------- запуск ----------
 
@@ -374,12 +394,141 @@ class VpnService:
                 details[proto] = f"ошибка: {str(e)[:200]}"
         return details
 
+    # ---------- входы для белых списков ----------
+
+    def _relay_client(self, row: Relay) -> RelayClient:
+        client = self._relay_clients.get(row.id)
+        if client is None:
+            if row.conn.startswith("mock:"):
+                client = MockRelay(row.conn[5:])
+            else:
+                self.pool.ssh.ensure_key()
+                client = RelayClient(SshRunner(row.conn, self.pool.ssh))
+            self._relay_clients[row.id] = client
+        return client
+
+    async def _drop_relay(self, relay_id: int) -> None:
+        client = self._relay_clients.pop(relay_id, None)
+        if client is not None:
+            await client.close()
+
+    @staticmethod
+    async def _resolve(host: str) -> str:
+        """IP для DNAT: iptables не умеет перенаправлять на домен."""
+        try:
+            return str(ipaddress.ip_address(host.strip("[]")))
+        except ValueError:
+            pass
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(host, None, family=socket.AF_INET)
+        except OSError as e:
+            raise ServiceError(f"не удалось узнать IP {host}: {e}") from e
+        return infos[0][4][0]
+
+    async def _target_port(self, row: Server, protocol: str) -> int:
+        client = await self.pool.get(row, protocol)
+        info = await (client.server_info() if protocol == "awg" else client.info())
+        return int(info.port)
+
+    async def desired_relay_ports(self, relay: Relay) -> list[RelayPort]:
+        """Какие порты входа на какие серверы вести. Порт, уже выданный клиентам, не меняется;
+        для недоступного сервера сохраняется прежнее направление."""
+        current = {(p.server_id, p.protocol): p for p in await self.db.relay_ports(relay.id)}
+        targets: dict[tuple[int, str], tuple[str, int]] = {}
+        wanted = []
+        for row in await self.db.servers():
+            protocols = set(row.protocol_list) | {proto for sid, proto in current if sid == row.id}
+            for proto in sorted(protocols):
+                key = (row.id, proto)
+                if row.status_ok and proto in row.protocol_list:
+                    try:
+                        targets[key] = (await self._resolve(row.host), await self._target_port(row, proto))
+                    except (AwgError, ServiceError) as e:
+                        log.warning("Вход %s: сервер %s (%s) пропущен: %s", relay.name, row.title, proto, e)
+                if key not in targets and key in current:
+                    targets[key] = (current[key].target_ip, current[key].target_port)
+                if key in targets:
+                    wanted.append((key, "udp" if proto == "awg" else "tcp", targets[key][1]))
+        reserved: set[tuple[str, int]] = set()
+        if not relay.conn.startswith("mock:"):
+            reserved.add(("tcp", parse_ssh_target(relay.conn)[2]))  # не занять порт SSH самого входа
+        ports = allocate_ports(wanted, {k: p.listen_port for k, p in current.items()}, reserved)
+        return [RelayPort(relay.id, sid, proto, ports[(sid, proto)], *targets[(sid, proto)]) for sid, proto in ports]
+
+    async def sync_relay(self, relay: Relay) -> RelayCheck:
+        """Проверяет вход и при необходимости перенастраивает перенаправления."""
+        async with self._relay_lock:
+            relay = await self.db.get_relay(relay.id) or relay
+            applied, error = False, ""
+            try:
+                ports = await self.desired_relay_ports(relay)
+                forwards = [Forward(p.transport, p.listen_port, p.target_ip, p.target_port) for p in ports]
+                applied = await self._relay_client(relay).sync(forwards)
+                await self.db.set_relay_ports(relay.id, ports)
+            except (AwgError, ServiceError) as e:
+                error = str(e)
+                await self._drop_relay(relay.id)
+            ok = not error
+            changed = bool(relay.status_ok) != ok
+            await self.db.update_relay(relay.id, status_ok=int(ok), last_error=error or None, last_check=now())
+            if applied:
+                log.info("Вход %s: перенаправления обновлены", relay.name)
+            fresh = await self.db.get_relay(relay.id)
+            return RelayCheck(fresh or relay, ok, changed, error, applied)
+
+    async def check_relays(self) -> list[RelayCheck]:
+        return [await self.sync_relay(r) for r in await self.db.relays()]
+
+    async def add_relay(self, name: str, host: str, conn: str) -> Relay:
+        try:
+            conn = validate_conn(conn)
+        except ValueError as e:
+            raise ServiceError(f"Неверное подключение: {e}")
+        if conn == "local":
+            raise ServiceError("Входной сервер должен быть отдельным сервером в РФ, а не сервером с ботом.")
+        if not host and not conn.startswith("mock:"):
+            host = parse_ssh_target(conn)[1]
+        relay = await self.db.add_relay(name, host, conn)
+        check = await self.sync_relay(relay)
+        if not check.ok:
+            await self.db.delete_relay(relay.id)
+            raise ServiceError(f"Не удалось настроить входной сервер: {check.error}")
+        return check.relay
+
+    async def update_relay(self, relay: Relay, **fields) -> RelayCheck:
+        await self.db.update_relay(relay.id, **fields)
+        await self._drop_relay(relay.id)
+        return await self.sync_relay(relay)
+
+    async def delete_relay(self, relay: Relay) -> None:
+        try:
+            await self._relay_client(relay).remove()
+        except (AwgError, ServiceError, OSError) as e:  # вход уже недоступен — просто забываем его
+            log.warning("Вход %s: не удалось убрать правила: %s", relay.name, e)
+        await self._drop_relay(relay.id)
+        await self.db.delete_relay(relay.id)
+        if relay.is_main:
+            rest = await self.db.relays()
+            if rest:
+                await self.db.set_main_relay(rest[0].id)
+
+    async def whitelist_route(self, key: Key) -> tuple[Relay, RelayPort] | None:
+        """Через какой вход и порт выдать ключ «для белых списков» (None — сейчас недоступно)."""
+        relay = await self.db.main_relay()
+        if relay is None or not relay.status_ok:
+            return None
+        for p in await self.db.relay_ports(relay.id):
+            if p.server_id == key.server_id and p.protocol == key.protocol:
+                return relay, p
+        return None
+
     # ---------- ключи ----------
 
-    def _params(self, key: Key, row: Server, info: ServerInfo) -> ClientParams:
+    def _params(self, key: Key, row: Server, info: ServerInfo, via: tuple[Relay, RelayPort] | None = None) -> ClientParams:
+        suffix = f" {WHITELIST_SUFFIX}" if via else ""
         return ClientParams(
-            host=row.host,
-            port=info.port,
+            host=via[0].host if via else row.host,
+            port=via[1].listen_port if via else info.port,
             client_ip=key.ip,
             client_private_key=key.private_key,
             client_public_key=key.public_key,
@@ -392,28 +541,45 @@ class VpnService:
             subnet_address=info.subnet_address,
             subnet_cidr=info.subnet_cidr,
             # Так сервер будет подписан в приложении AmneziaVPN: «MyVPN 🇩🇪 Германия»
-            description=f"{self.settings.server_name} {row.title}",
+            description=f"{self.settings.server_name} {row.title}{suffix}",
             mtu=self.settings.client_mtu,
         )
 
-    def _rendered_awg(self, key: Key, row: Server, info: ServerInfo) -> RenderedKey:
-        params = self._params(key, row, info)
+    def _rendered_awg(
+        self, key: Key, row: Server, info: ServerInfo, via: tuple[Relay, RelayPort] | None = None
+    ) -> RenderedKey:
+        params = self._params(key, row, info, via)
         return RenderedKey(
-            key, build_vpn_url(params), build_native_config(params), self.settings.server_name, row.title
+            key,
+            build_vpn_url(params),
+            build_native_config(params),
+            self.settings.server_name,
+            row.title,
+            whitelist=via is not None,
         )
 
-    def _rendered_vless(self, key: Key, row: Server, info) -> RenderedKey:
+    def _rendered_vless(self, key: Key, row: Server, info, via: tuple[Relay, RelayPort] | None = None) -> RenderedKey:
         label = f"{self.settings.server_name} {row.title} {key.name}"
-        url = build_vless_url(info, row.host, key.public_key, label)
-        return RenderedKey(key, url, "", self.settings.server_name, row.title)
+        host = row.host
+        if via:
+            label += f" {WHITELIST_SUFFIX}"
+            host, info = via[0].host, replace(info, port=via[1].listen_port)
+        url = build_vless_url(info, host, key.public_key, label)
+        return RenderedKey(key, url, "", self.settings.server_name, row.title, whitelist=via is not None)
 
-    async def render(self, key: Key) -> RenderedKey:
+    async def render(self, key: Key, whitelist: bool = False) -> RenderedKey:
+        """whitelist=True — тот же ключ, но через основной входной сервер (для белых списков)."""
         # Параметры читаются с сервера каждый раз: если их поменяли в приложении
         # Amnezia, повторно отправленный ключ будет актуальным.
+        via = None
+        if whitelist:
+            via = await self.whitelist_route(key)
+            if via is None:
+                raise ServiceError("Ключ для белых списков сейчас недоступен — попробуйте позже.")
         row, client = await self._client(key.server_id, key.protocol)
         if key.protocol == "vless":
-            return self._rendered_vless(key, row, await client.info())
-        return self._rendered_awg(key, row, await client.server_info())
+            return self._rendered_vless(key, row, await client.info(), via)
+        return self._rendered_awg(key, row, await client.server_info(), via)
 
     def base_limit(self, user: User) -> int:
         """Устройств по тарифу (без доп. слотов)."""
@@ -855,6 +1021,8 @@ class VpnService:
 
     async def close(self) -> None:
         await self.pool.close()
+        for relay_id in list(self._relay_clients):
+            await self._drop_relay(relay_id)
         if self.yoomoney:
             await self.yoomoney.close()
 

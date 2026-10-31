@@ -9,6 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
+from ..awg.runner import parse_ssh_target
 from ..awg.server import AwgError
 from ..db import PROTOCOLS, Database, User, now
 from ..service import MAX_DAYS, MAX_DEVICES, ServiceError, VpnService
@@ -30,6 +31,7 @@ from .common import deliver_key, edit_or_send, notify_payment_confirmed, send_lo
 from .keyboards import (
     AK,
     AU,
+    ARelay,
     BTN_ADMIN,
     MENU_TEXTS,
     AAdd,
@@ -75,6 +77,7 @@ class AdminStates(StatesGroup):
     broadcast = State()
     plan = State()
     server = State()
+    relay = State()
 
 
 def panel_kb(pending: int):
@@ -1038,6 +1041,7 @@ async def cb_servers(call: CallbackQuery, state: FSMContext, db: Database) -> No
     if not servers:
         lines.append("Серверов пока нет — добавьте первый.")
     rows.append([("➕ Добавить сервер", ASrv(action="add").pack())])
+    rows.append([("🛡 Входы для белых списков", ARelay(action="list").pack())])
     rows.append([("🔄 Проверить все", ASrv(action="checkall").pack()), back(Adm(action="panel"))])
     await edit_or_send(call, "\n".join(lines), ikb(rows))
 
@@ -1302,6 +1306,327 @@ async def cb_server_moveallok(call: CallbackQuery, callback_data: ASrv, bot: Bot
         f"🚚 Готово: перенесено {ok}" + (f", не удалось {failed} (см. логи)" if failed else "") + ".",
         reply_markup=ikb([[("🖥 Серверы", ASrv(action="list").pack())]]),
     )
+
+
+# ---------- входы для белых списков ----------
+#
+# Входной сервер в РФ просто перенаправляет пакеты на зарубежные серверы. Клиенты получают
+# дополнительный «ключ для белых списков» (тот же ключ, другой адрес) — без лишнего слота.
+
+_RELAY_TASKS: set[asyncio.Task] = set()
+
+
+def _relay_help(pubkey: str) -> str:
+    return (
+        "🛡 <b>Входной сервер для белых списков</b>\n\n"
+        "Нужен VPS в России, чей IP открыт в режиме белых списков (обычно — облака крупных российских "
+        "компаний). Проверьте с мобильного интернета в этом режиме, что до него есть пинг. "
+        "VPN на нём не нужен — бот сам настроит перенаправление (iptables) на все ваши серверы.\n\n"
+        "1. Разрешите боту вход по SSH — выполните на входном сервере:\n"
+        f"<pre>mkdir -p ~/.ssh &amp;&amp; echo '{esc(pubkey)}' &gt;&gt; ~/.ssh/authorized_keys</pre>\n"
+        "2. Отправьте сюда строку:\n"
+        "<code>Название | IP или домен</code>\n"
+        "например: <code>Москва | 7.8.9.10</code>\n\n"
+        "Если SSH не на 22 порту или пользователь не root, добавьте третьим полем подключение:\n"
+        "<code>Москва | 7.8.9.10 | admin@7.8.9.10:2222</code> (нужен sudo без пароля).\n"
+        "Если в ключах должен быть домен, а подключаться по SSH нужно к IP: "
+        "<code>Москва | vpn-ru.example.ru | root@7.8.9.10</code>\n\n"
+        "Отмена — /cancel"
+    )
+
+
+def _parse_relay_line(text: str) -> tuple[str, str, str]:
+    parts = [p.strip() for p in text.split("|")]
+    if len(parts) not in (2, 3) or not all(parts[:2]):
+        raise ValueError
+    name, host = parts[0][:40], parts[1][:255]
+    conn = parts[2] if len(parts) == 3 and parts[2] else f"root@{host}"
+    return name, host, conn
+
+
+async def _relay_or_alert(call: CallbackQuery, db: Database, relay_id: int):
+    relay = await db.get_relay(relay_id)
+    if relay is None:
+        await call.answer("Вход не найден", show_alert=True)
+    return relay
+
+
+@router.callback_query(ARelay.filter(F.action == "list"))
+async def cb_relays(call: CallbackQuery, state: FSMContext, db: Database) -> None:
+    await state.clear()
+    await call.answer()
+    relays = await db.relays()
+    lines = [
+        "🛡 <b>Входы для белых списков</b>\n",
+        "Клиенты получают в карточке устройства кнопку «🛡 Ключ для белых списков» — тот же ключ, "
+        "но через входной сервер в РФ. Ключи выдаются через <b>основной</b> вход (⭐), "
+        "остальные — запасные: если основной заблокируют, сделайте основным запасной и разошлите ключи.\n",
+    ]
+    rows = []
+    for r in relays:
+        mark = "🟢" if r.status_ok else "🔴"
+        star = "⭐ " if r.is_main else ""
+        lines.append(f"{mark} {star}{esc(r.name)} — <code>{esc(r.host)}</code>")
+        rows.append([(f"{mark} {star}{r.name}", ARelay(action="view", id=r.id).pack())])
+    if not relays:
+        lines.append("Входов пока нет — кнопка «Ключ для белых списков» у клиентов не показывается.")
+    rows.append([("➕ Добавить вход", ARelay(action="add").pack())])
+    rows.append([back(ASrv(action="list"))])
+    await edit_or_send(call, "\n".join(lines), ikb(rows))
+
+
+async def relay_card(db: Database, relay) -> tuple[str, object]:
+    servers = {s.id: s for s in await db.servers()}
+    ports = await db.relay_ports(relay.id)
+    lines = [
+        f"🛡 <b>{esc(relay.name)}</b>" + (" ⭐ основной" if relay.is_main else " (запасной)"),
+        f"Статус: {'🟢 работает' if relay.status_ok else '🔴 недоступен'}",
+        f"Адрес в ключах: <code>{esc(relay.host)}</code>",
+        f"Подключение: {esc(_conn_label(relay.conn))}",
+        f"Проверен: {fmt_dt(relay.last_check)}",
+    ]
+    if relay.last_error:
+        lines.append(f"Ошибка: <code>{esc(relay.last_error[:400])}</code>")
+    lines.append("\n<b>Перенаправления:</b>")
+    for p in ports:
+        srv = servers.get(p.server_id)
+        title = srv.title if srv else f"сервер #{p.server_id}"
+        lines.append(
+            f"{esc(title)} · {PROTO_SHORT.get(p.protocol, p.protocol)}: "
+            f"порт {p.listen_port}/{p.transport} → <code>{esc(p.target_ip)}:{p.target_port}</code>"
+        )
+    if not ports:
+        lines.append("пока нет")
+    rows = [[("🔄 Проверить и применить", ARelay(action="sync", id=relay.id).pack())]]
+    if relay.is_main:
+        rows.append([("📨 Разослать ключи для белых списков", ARelay(action="send", id=relay.id).pack())])
+    else:
+        rows.append([("⭐ Сделать основным", ARelay(action="main", id=relay.id).pack())])
+    rows += [
+        [("✏️ Изменить", ARelay(action="edit", id=relay.id).pack()), ("🔑 Сбросить SSH-ключ", ARelay(action="resetkey", id=relay.id).pack())],
+        [("🗑 Удалить", ARelay(action="del", id=relay.id).pack())],
+        [back(ARelay(action="list"))],
+    ]
+    return "\n".join(lines), ikb(rows)
+
+
+@router.callback_query(ARelay.filter(F.action == "view"))
+async def cb_relay_view(call: CallbackQuery, callback_data: ARelay, db: Database) -> None:
+    relay = await _relay_or_alert(call, db, callback_data.id)
+    if relay is None:
+        return
+    await call.answer()
+    text, kb = await relay_card(db, relay)
+    await edit_or_send(call, text, kb)
+
+
+@router.callback_query(ARelay.filter(F.action.in_({"add", "edit"})))
+async def cb_relay_add(call: CallbackQuery, callback_data: ARelay, state: FSMContext, db: Database, service: VpnService) -> None:
+    await call.answer()
+    await state.set_state(AdminStates.relay)
+    await state.update_data(relay_id=callback_data.id if callback_data.action == "edit" else 0)
+    try:
+        pubkey = await asyncio.to_thread(service.pool.ssh.ensure_key)
+    except Exception as e:
+        pubkey = f"(не удалось создать SSH-ключ: {e})"
+    text = _relay_help(pubkey)
+    if callback_data.action == "edit":
+        relay = await db.get_relay(callback_data.id)
+        if relay:
+            text = (
+                f"✏️ Текущие данные:\n<code>{esc(relay.name)} | {esc(relay.host)} | {esc(relay.conn)}</code>\n\n"
+                "⚠️ Если поменять адрес, ключи для белых списков у клиентов изменятся — после сохранения "
+                "разошлите им новые.\n\n" + text
+            )
+    await call.message.answer(text)
+
+
+@router.message(AdminStates.relay, _INPUT)
+async def st_relay(message: Message, state: FSMContext, db: Database, service: VpnService) -> None:
+    try:
+        name, host, conn = _parse_relay_line(message.text)
+    except ValueError:
+        await message.answer("Не получилось разобрать. Формат: <code>Название | IP</code> (или /cancel)")
+        return
+    data = await state.get_data()
+    wait = await message.answer("⏳ Подключаюсь к входному серверу и настраиваю перенаправление…")
+    try:
+        if data.get("relay_id"):
+            relay = await db.get_relay(data["relay_id"])
+            if relay is None:
+                await state.clear()
+                await wait.edit_text("Вход не найден.")
+                return
+            from ..service import validate_conn
+
+            res = await service.update_relay(relay, name=name, host=host, conn=validate_conn(conn))
+            relay = res.relay
+            result = "✅ Сохранено, вход работает." if res.ok else f"⚠️ Сохранено, но вход не отвечает:\n<code>{esc(res.error)}</code>"
+        else:
+            relay = await service.add_relay(name, host, conn)
+            result = f"✅ Вход {esc(relay.name)} настроен." + (
+                " Он основной — у клиентов появилась кнопка «🛡 Ключ для белых списков»." if relay.is_main else ""
+            )
+    except (ServiceError, ValueError) as e:
+        await wait.edit_text(f"❌ {esc(e)}\n\nИсправьте и отправьте строку ещё раз (или /cancel).")
+        return
+    await state.clear()
+    await wait.edit_text(result, reply_markup=ikb([[("🛡 Открыть вход", ARelay(action="view", id=relay.id).pack())]]))
+
+
+@router.callback_query(ARelay.filter(F.action == "sync"))
+async def cb_relay_sync(call: CallbackQuery, callback_data: ARelay, db: Database, service: VpnService) -> None:
+    relay = await _relay_or_alert(call, db, callback_data.id)
+    if relay is None:
+        return
+    await call.answer("Проверяю…")
+    res = await service.sync_relay(relay)
+    if res.ok:
+        note = "✅ Вход работает" + (", перенаправления обновлены." if res.applied else ", всё уже настроено.")
+    else:
+        note = f"🔴 Вход не отвечает: <code>{esc(res.error[:400])}</code>"
+    text, kb = await relay_card(db, res.relay)
+    await edit_or_send(call, f"{note}\n\n{text}", kb)
+
+
+@router.callback_query(ARelay.filter(F.action == "main"))
+async def cb_relay_main(call: CallbackQuery, callback_data: ARelay, db: Database) -> None:
+    relay = await _relay_or_alert(call, db, callback_data.id)
+    if relay is None:
+        return
+    await db.set_main_relay(relay.id)
+    await call.answer("Теперь это основной вход")
+    text, kb = await relay_card(db, await db.get_relay(relay.id))
+    await edit_or_send(
+        call,
+        "⭐ Ключи для белых списков теперь выдаются через этот вход. Старые ключи клиентов ведут на "
+        "прежний вход — разошлите новые кнопкой ниже.\n\n" + text,
+        kb,
+    )
+
+
+@router.callback_query(ARelay.filter(F.action == "resetkey"))
+async def cb_relay_resetkey(call: CallbackQuery, callback_data: ARelay, db: Database, service: VpnService) -> None:
+    relay = await _relay_or_alert(call, db, callback_data.id)
+    if relay is None:
+        return
+    try:
+        _, host, port = parse_ssh_target(relay.conn)
+    except ValueError:
+        await call.answer("Это не SSH-подключение", show_alert=True)
+        return
+    service.pool.ssh.forget(host, port)
+    await service._drop_relay(relay.id)
+    await call.answer("Ключ сервера забыт — при следующем подключении будет запомнен новый", show_alert=True)
+
+
+@router.callback_query(ARelay.filter(F.action == "del"))
+async def cb_relay_del(call: CallbackQuery, callback_data: ARelay, db: Database) -> None:
+    relay = await _relay_or_alert(call, db, callback_data.id)
+    if relay is None:
+        return
+    await call.answer()
+    warn = (
+        "\n\n⚠️ Это основной вход: ключи для белых списков у клиентов перестанут работать. "
+        "Основным станет следующий вход (если есть) — разошлите ключи заново."
+        if relay.is_main
+        else ""
+    )
+    await edit_or_send(
+        call,
+        f"Удалить вход {esc(relay.name)}? Бот уберёт с него свои правила перенаправления.{warn}",
+        ikb([[("🗑 Да, удалить", ARelay(action="delok", id=relay.id).pack()), back(ARelay(action="view", id=relay.id), "Отмена")]]),
+    )
+
+
+@router.callback_query(ARelay.filter(F.action == "delok"))
+async def cb_relay_delok(call: CallbackQuery, callback_data: ARelay, state: FSMContext, db: Database, service: VpnService) -> None:
+    relay = await _relay_or_alert(call, db, callback_data.id)
+    if relay is None:
+        return
+    await service.delete_relay(relay)
+    await cb_relays(call, state, db)
+
+
+async def _whitelist_targets(db: Database, service: VpnService) -> list[tuple[User, list]]:
+    """Пользователи с доступом и их включённые устройства, для которых есть ключ через основной вход."""
+    result = []
+    for uid in await db.all_user_ids("all"):
+        user = await db.get_user(uid)
+        if user is None or not service.has_access(user):
+            continue
+        keys = [k for k in await db.user_keys(uid) if k.enabled and await service.whitelist_route(k)]
+        if keys:
+            result.append((user, keys))
+    return result
+
+
+@router.callback_query(ARelay.filter(F.action == "send"))
+async def cb_relay_send(call: CallbackQuery, callback_data: ARelay, db: Database, service: VpnService) -> None:
+    relay = await _relay_or_alert(call, db, callback_data.id)
+    if relay is None:
+        return
+    if not relay.is_main or not relay.status_ok:
+        await call.answer("Рассылать можно только через работающий основной вход", show_alert=True)
+        return
+    targets = await _whitelist_targets(db, service)
+    keys = sum(len(k) for _, k in targets)
+    await call.answer()
+    await edit_or_send(
+        call,
+        f"📨 Отправить ключи для белых списков через «{esc(relay.name)}»?\n\n"
+        f"Получат: {len(targets)} чел., устройств: {keys}. Обычные ключи клиентов не меняются — "
+        "это дополнительное подключение.",
+        ikb([[("📨 Да, отправить", ARelay(action="sendok", id=relay.id).pack()), back(ARelay(action="view", id=relay.id), "Отмена")]]),
+    )
+
+
+@router.callback_query(ARelay.filter(F.action == "sendok"))
+async def cb_relay_sendok(call: CallbackQuery, callback_data: ARelay, bot: Bot, db: Database, service: VpnService) -> None:
+    relay = await _relay_or_alert(call, db, callback_data.id)
+    if relay is None:
+        return
+    targets = await _whitelist_targets(db, service)
+    await call.answer("Отправляю…")
+    status = await call.message.answer(f"📤 Отправляю ключи для белых списков {len(targets)} пользователям…")
+
+    async def run() -> None:
+        users_ok = keys_ok = failed = 0
+        for user, keys in targets:
+            sent = 0
+            try:
+                await bot.send_message(
+                    user.tg_id,
+                    "🛡 <b>Ключи для белых списков</b>\n\n"
+                    "Если мобильный интернет пускает только разрешённые сайты и VPN не подключается — "
+                    "используйте ключи ниже. Добавьте их в приложение <b>вторым подключением</b> (обычные не удаляйте) "
+                    "и переключайтесь на них, когда обычное подключение не работает.",
+                )
+                for key in keys:
+                    try:
+                        await deliver_key(bot, user.tg_id, await service.render(key, whitelist=True))
+                        sent += 1
+                    except (ServiceError, AwgError) as e:
+                        log.warning("Ключ для белых списков #%s: %s", key.id, e)
+                        failed += 1
+                    await asyncio.sleep(0.2)
+            except Exception:
+                failed += 1  # заблокировал бота и т.п.
+            if sent:
+                users_ok += 1
+                keys_ok += sent
+            await asyncio.sleep(0.3)  # лимиты Telegram
+        try:
+            await status.edit_text(
+                f"✅ Готово: {users_ok} пользователям отправлено {keys_ok} ключей" + (f", ошибок: {failed}" if failed else "") + ".",
+                reply_markup=ikb([[("🛡 К входу", ARelay(action="view", id=relay.id).pack())]]),
+            )
+        except Exception:
+            pass
+
+    task = asyncio.create_task(run())
+    _RELAY_TASKS.add(task)
+    task.add_done_callback(_RELAY_TASKS.discard)
 
 
 # ---------- неактивные аккаунты ----------
