@@ -635,6 +635,18 @@ class Database:
         ) as cur:
             return {r[0]: (r[1], r[2] or 0, r[3] or 0) for r in await cur.fetchall()}
 
+    async def server_protocol_counts(self) -> dict[int, dict[str, tuple[int, int]]]:
+        """server_id -> {протокол: (устройств, онлайн за 3 мин)}."""
+        result: dict[int, dict[str, tuple[int, int]]] = {}
+        async with self.c.execute(
+            """SELECT server_id, protocol, COUNT(*), SUM(enabled = 1 AND last_handshake >= ?)
+               FROM keys GROUP BY server_id, protocol""",
+            (now() - 180,),
+        ) as cur:
+            for sid, proto, total, online in await cur.fetchall():
+                result.setdefault(sid, {})[proto] = (total, online or 0)
+        return result
+
     async def assign_orphan_keys(self, server_id: int) -> int:
         """Ключи из версии бота без мультисерверности привязываются к первому серверу."""
         n = await self._exec("UPDATE keys SET server_id = ? WHERE server_id IS NULL", (server_id,))

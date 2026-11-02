@@ -151,3 +151,54 @@ async def test_duplicate_server_rejected(multi):  # noqa: F811
     with pytest.raises(ServiceError, match="уже добавлен"):
         await svc.add_server("Копия", "🇩🇪", nl.host, "mock:/tmp/elsewhere")
     await svc.check_duplicate(de.host, de.conn, exclude_id=de.id)  # сам с собой — не дубль
+
+
+async def test_server_protocol_counts(multi):  # noqa: F811
+    svc = multi
+    de, nl, _ = await svc.db.servers()
+    user = await user_with_sub(svc)
+    await svc.create_device(user, "A", de.id, "awg")
+    await svc.create_device(user, "B", de.id, "vless")
+    k = (await svc.create_device(user, "C", de.id, "vless")).key
+    await svc.db.update_key(k.id, last_handshake=svc_now())
+    counts = await svc.db.server_protocol_counts()
+    assert counts[de.id] == {"awg": (1, 0), "vless": (2, 1)}
+    assert nl.id not in counts
+
+
+def svc_now():
+    from bot.db import now
+
+    return now()
+
+
+class FakeCall:
+    def __init__(self, uid=1, data="a:ban:5"):
+        self.from_user = type("U", (), {"id": uid})()
+        self.data = data
+        self.alerts = []
+
+    async def answer(self, text=None, show_alert=False):
+        self.alerts.append((text, show_alert))
+
+
+async def test_confirm_tap(monkeypatch):
+    from bot.handlers import common
+
+    call = FakeCall()
+    assert await common.confirm_tap(call, "Забанить?") is False
+    text, alert = call.alerts[0]
+    assert alert and text.startswith("⚠️ Забанить?") and "ещё раз" in text
+    assert await common.confirm_tap(call, "Забанить?") is True  # второе нажатие — выполняем
+    assert await common.confirm_tap(call, "Забанить?") is False  # и снова спрашиваем
+    # другая кнопка или другой админ — отдельное подтверждение
+    assert await common.confirm_tap(FakeCall(uid=2), "Забанить?") is False
+    assert await common.confirm_tap(FakeCall(data="a:del:5"), "Удалить?") is False
+    # длинный вопрос обрезается под лимит Telegram (200 символов)
+    long_call = FakeCall(data="x")
+    await common.confirm_tap(long_call, "очень " * 100)
+    assert len(long_call.alerts[0][0]) <= 200
+    # подтверждение «протухает»
+    monkeypatch.setattr(common, "CONFIRM_WINDOW", -1)
+    assert await common.confirm_tap(FakeCall(data="y"), "?") is False
+    assert await common.confirm_tap(FakeCall(data="y"), "?") is False

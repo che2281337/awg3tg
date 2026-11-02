@@ -16,6 +16,31 @@ log = logging.getLogger(__name__)
 
 MAX_TEXT = 4000
 
+# Подтверждение опасных действий: первое нажатие показывает всплывающее окно с вопросом,
+# повторное нажатие той же кнопки в течение CONFIRM_WINDOW секунд выполняет действие.
+CONFIRM_WINDOW = 15
+_ALERT_LIMIT = 200  # Telegram обрезает текст всплывающего окна
+_pending_confirms: dict[tuple[int, str], float] = {}
+
+
+async def confirm_tap(call: CallbackQuery, question: str) -> bool:
+    """True — действие подтверждено (кнопку нажали второй раз). False — показан вопрос."""
+    t = time.monotonic()
+    for k, ts in list(_pending_confirms.items()):
+        if t - ts > CONFIRM_WINDOW:
+            del _pending_confirms[k]
+    key = (call.from_user.id, call.data or "")
+    if key in _pending_confirms:
+        del _pending_confirms[key]
+        return True
+    _pending_confirms[key] = t
+    hint = f"\n\nНажмите кнопку ещё раз, чтобы подтвердить ({CONFIRM_WINDOW} с)."
+    question = "⚠️ " + question
+    if len(question) + len(hint) > _ALERT_LIMIT:
+        question = question[: _ALERT_LIMIT - len(hint) - 1] + "…"
+    await call.answer(question + hint, show_alert=True)
+    return False
+
 
 def help_text(support: str) -> str:
     text = (

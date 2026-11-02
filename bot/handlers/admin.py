@@ -27,7 +27,7 @@ from ..utils import (
     plural,
     today,
 )
-from .common import deliver_key, edit_or_send, notify_payment_confirmed, send_long
+from .common import confirm_tap, deliver_key, edit_or_send, notify_payment_confirmed, send_long
 from .keyboards import (
     AK,
     AU,
@@ -270,8 +270,17 @@ async def _extend(bot: Bot, service: VpnService, uid: int, days: int) -> str:
     return f"Подписка до {fmt_dt(user.sub_until)}"
 
 
+async def _uname(db: Database, uid: int) -> str:
+    u = await db.get_user(uid)
+    return u.title if u else str(uid)
+
+
 @router.callback_query(AU.filter(F.action == "ext"))
 async def cb_extend(call: CallbackQuery, callback_data: AU, bot: Bot, db: Database, service: VpnService) -> None:
+    if callback_data.arg < 0 and not await confirm_tap(
+        call, f"Уменьшить подписку {await _uname(db, callback_data.uid)} на {days_word(-callback_data.arg)}?"
+    ):
+        return
     try:
         result = await _extend(bot, service, callback_data.uid, callback_data.arg)
     except (ServiceError, AwgError) as e:
@@ -323,6 +332,10 @@ async def cmd_extend(message: Message, command: CommandObject, bot: Bot, service
 
 @router.callback_query(AU.filter(F.action == "sub0"))
 async def cb_sub0(call: CallbackQuery, callback_data: AU, db: Database, service: VpnService) -> None:
+    if not await confirm_tap(
+        call, f"Обнулить подписку {await _uname(db, callback_data.uid)}? Все его устройства сразу отключатся."
+    ):
+        return
     await service.set_sub_until(callback_data.uid, now())
     await call.answer("Подписка обнулена, устройства отключены")
     await _refresh_card(call, db, service, callback_data.uid)
@@ -336,6 +349,11 @@ async def cb_dev_limit(call: CallbackQuery, callback_data: AU, db: Database, ser
         return
     current = u.device_limit or service.settings.default_devices
     new = max(0, min(current + callback_data.arg, MAX_DEVICES))
+    enabled = sum(1 for k in await db.user_keys(u.tg_id) if k.enabled)
+    if new < current and enabled > new and not await confirm_tap(
+        call, f"Уменьшить лимит до {new}? Лишние устройства {u.title} отключатся."
+    ):
+        return
     await service.set_device_limit(u.tg_id, new)
     await call.answer(f"Лимит устройств: {new}")
     await _refresh_card(call, db, service, u.tg_id)
@@ -347,6 +365,10 @@ async def cb_ban(call: CallbackQuery, callback_data: AU, bot: Bot, db: Database,
         await call.answer("Нельзя забанить администратора", show_alert=True)
         return
     if callback_data.action == "ban":
+        if not await confirm_tap(
+            call, f"Забанить {await _uname(db, callback_data.uid)}? Все его устройства отключатся, бот перестанет ему отвечать."
+        ):
+            return
         await service.ban(callback_data.uid)
         await call.answer("Забанен, устройства отключены")
     else:
@@ -379,23 +401,17 @@ async def cmd_ban(message: Message, command: CommandObject, bot: Bot, service: V
 
 
 @router.callback_query(AU.filter(F.action == "del"))
-async def cb_del_user(call: CallbackQuery, callback_data: AU, db: Database) -> None:
-    await call.answer()
-    u = await db.get_user(callback_data.uid)
-    name = esc(u.title) if u else callback_data.uid
-    await edit_or_send(
+async def cb_del_user(call: CallbackQuery, callback_data: AU, db: Database, service: VpnService) -> None:
+    if service.is_admin(callback_data.uid):
+        await call.answer("Нельзя удалить администратора", show_alert=True)
+        return
+    if not await confirm_tap(
         call,
-        f"Удалить аккаунт {name}? Все его устройства будут удалены с сервера, статистика стёрта. "
-        "История платежей сохранится.",
-        ikb(
-            [
-                [
-                    ("🗑 Да, удалить", AU(action="delok", uid=callback_data.uid).pack()),
-                    back(AU(action="card", uid=callback_data.uid), "Отмена"),
-                ]
-            ]
-        ),
-    )
+        f"Удалить аккаунт {await _uname(db, callback_data.uid)}? Его устройства удалятся с серверов, "
+        "статистика сотрётся. Отменить нельзя.",
+    ):
+        return
+    await cb_del_user_ok(call, callback_data, service)
 
 
 @router.callback_query(AU.filter(F.action == "delok"))
@@ -499,6 +515,14 @@ async def _slots_view(db: Database, service: VpnService, uid: int):
 @router.callback_query(ASlot.filter())
 async def cb_slots(call: CallbackQuery, callback_data: ASlot, bot: Bot, db: Database, service: VpnService) -> None:
     uid, action = callback_data.uid, callback_data.action
+    if action == "del" and not await confirm_tap(
+        call, "Удалить доп. слот? Если устройств станет больше лимита, самые новые отключатся."
+    ):
+        return
+    if action == "ext" and callback_data.arg < 0 and not await confirm_tap(
+        call, f"Уменьшить срок слота на {days_word(-callback_data.arg)}?"
+    ):
+        return
     try:
         if action == "add":
             slot = await service.add_slot(uid, callback_data.arg)
@@ -640,6 +664,13 @@ async def cb_key_move(call: CallbackQuery, callback_data: AMove, bot: Bot, db: D
         rows.append([back(AK(action="view", id=key.id))])
         await edit_or_send(call, f"Куда перенести #{key.id} {esc(key.name)}?", ikb(rows))
         return
+    target = await db.get_server(callback_data.sid)
+    if not await confirm_tap(
+        call,
+        f"Перенести «{key.name}» на {target.title if target else 'другой сервер'}? "
+        "Клиенту придётся заново добавить ключ в приложение.",
+    ):
+        return
     try:
         rk = await service.move_device(key, callback_data.sid, force=True)
     except (ServiceError, AwgError) as e:
@@ -667,13 +698,15 @@ async def cb_key_send(call: CallbackQuery, callback_data: AK, bot: Bot, db: Data
 
 
 @router.callback_query(AK.filter(F.action == "del"))
-async def cb_key_del(call: CallbackQuery, callback_data: AK) -> None:
-    await call.answer()
-    await edit_or_send(
-        call,
-        f"Удалить ключ #{callback_data.id}?",
-        ikb([[("🗑 Да", AK(action="delok", id=callback_data.id).pack()), back(AK(action="view", id=callback_data.id), "Отмена")]]),
-    )
+async def cb_key_del(call: CallbackQuery, callback_data: AK, bot: Bot, db: Database, service: VpnService) -> None:
+    key = await db.get_key(callback_data.id)
+    if key is None:
+        await call.answer("Уже удалён", show_alert=True)
+        return
+    owner = await _uname(db, key.tg_id) if key.tg_id else "без владельца"
+    if not await confirm_tap(call, f"Удалить устройство «{key.name}» ({owner})? Его ключ перестанет работать."):
+        return
+    await cb_key_delok(call, callback_data, bot, db, service)
 
 
 @router.callback_query(AK.filter(F.action == "delok"))
@@ -760,6 +793,11 @@ async def cb_payment_ok(call: CallbackQuery, callback_data: APay, bot: Bot, serv
 
 @router.callback_query(APay.filter(F.action == "no"))
 async def cb_payment_no(call: CallbackQuery, callback_data: APay, bot: Bot, service: VpnService) -> None:
+    pending = await service.db.get_payment(callback_data.id)
+    if pending is not None and pending.status == "pending" and not await confirm_tap(
+        call, f"Отклонить оплату №{pending.id} на {pending.amount} {service.settings.currency}? Клиенту придёт отказ."
+    ):
+        return
     try:
         p = await service.reject_payment(callback_data.id, call.from_user.id)
     except ServiceError as e:
@@ -910,6 +948,11 @@ async def cb_plan_toggle(call: CallbackQuery, callback_data: APlan, db: Database
 
 @router.callback_query(APlan.filter(F.action == "del"))
 async def cb_plan_del(call: CallbackQuery, callback_data: APlan, db: Database, service: VpnService) -> None:
+    plan = await db.get_plan(callback_data.id)
+    if plan is not None and not await confirm_tap(
+        call, f"Удалить тариф «{plan.title}»? Если хотите только убрать его из продажи — лучше скройте."
+    ):
+        return
     await db.delete_plan(callback_data.id)
     await cb_plans(call, db, service)
 
@@ -1029,15 +1072,26 @@ async def cb_servers(call: CallbackQuery, state: FSMContext, db: Database) -> No
     await call.answer()
     servers = await db.servers()
     counts = await db.server_key_counts()
-    lines = ["🖥 <b>Серверы</b>\n", "🟢 работает · 🔴 недоступен · 🙈 скрыт для новых устройств\n"]
+    by_proto = await db.server_protocol_counts()
+    lines = [
+        "🖥 <b>Серверы</b>\n",
+        "🟢 работает · 🔴 недоступен · 🙈 скрыт для новых устройств",
+        "Число у протокола — сколько на нём устройств (в скобках — онлайн)\n",
+    ]
     rows = []
     for s in servers:
         total, _, online = counts.get(s.id, (0, 0, 0))
         mark = ("🟢" if s.status_ok else "🔴") + ("" if s.active else "🙈")
-        protos = "+".join(PROTO_SHORT[p] + ("🙈" if p in s.hidden_list else "") for p in s.protocol_list) or "—"
-        label = f"{mark} {s.title} · {protos} · {total} устр. · онлайн {online}"
-        lines.append(esc(label))
-        rows.append([(label, ASrv(action="view", id=s.id).pack())])
+        per = by_proto.get(s.id, {})
+        # протоколы сервера + те, на которых ещё остались устройства (например, после удаления XRay)
+        names = [p for p in PROTOCOLS if p in s.protocol_list or p in per]
+        protos = " · ".join(
+            f"{PROTO_SHORT[p]}{'🙈' if p in s.hidden_list else ''}{'' if p in s.protocol_list else '❔'} "
+            f"{per.get(p, (0, 0))[0]} ({per.get(p, (0, 0))[1]})"
+            for p in names
+        ) or "протоколы не найдены"
+        lines.append(f"{mark} <b>{esc(s.title)}</b>\n    {esc(protos)} · всего {total}, онлайн {online}")
+        rows.append([(f"{mark} {s.title} · {total} устр. · онлайн {online}", ASrv(action="view", id=s.id).pack())])
     if not servers:
         lines.append("Серверов пока нет — добавьте первый.")
     rows.append([("➕ Добавить сервер", ASrv(action="add").pack())])
@@ -1069,6 +1123,11 @@ async def server_card(db: Database, service: VpnService, row) -> tuple[str, obje
     if row.last_error:
         lines.append(f"Ошибка: <code>{esc(row.last_error[:400])}</code>")
     lines.append(f"\nУстройств в боте: {total} (активных {enabled})")
+    per = (await db.server_protocol_counts()).get(row.id, {})
+    if per:
+        lines.append(
+            " · ".join(f"{PROTOCOLS[p]}: {per[p][0]} (онлайн {per[p][1]})" for p in PROTOCOLS if p in per)
+        )
     details = await service.server_details(row) if row.status_ok else {}
     lines.append("\n<b>Протоколы:</b>")
     for proto, title in PROTOCOLS.items():
@@ -1154,6 +1213,10 @@ async def cb_server_resetkey(call: CallbackQuery, callback_data: ASrv, db: Datab
         _, host, port = parse_ssh_target(row.conn)
     except ValueError:
         await call.answer("Это не SSH-сервер", show_alert=True)
+        return
+    if not await confirm_tap(
+        call, "Забыть SSH-ключ сервера? Делайте это, только если сами переустанавливали сервер — иначе это может быть подмена."
+    ):
         return
     service.pool.ssh.forget(host, port)
     await service.pool.drop(row.id)
@@ -1352,19 +1415,16 @@ def _start_key_mailing(bot: Bot, service: VpnService, targets, intro: str, white
 
 
 @router.callback_query(ASrv.filter(F.action == "del"))
-async def cb_server_del(call: CallbackQuery, callback_data: ASrv, db: Database) -> None:
+async def cb_server_del(call: CallbackQuery, callback_data: ASrv, state: FSMContext, db: Database, service: VpnService) -> None:
     row = await _server_or_alert(call, db, callback_data.id)
     if row is None:
         return
     if await db.server_keys(row.id):
         await call.answer("На сервере есть устройства — сначала перенесите клиентов", show_alert=True)
         return
-    await call.answer()
-    await edit_or_send(
-        call,
-        f"Удалить сервер {esc(row.title)} из бота? На самом сервере ничего не изменится.",
-        ikb([[("🗑 Да, удалить", ASrv(action="delok", id=row.id).pack()), back(ASrv(action="view", id=row.id), "Отмена")]]),
-    )
+    if not await confirm_tap(call, f"Удалить сервер {row.title} из бота? На самом сервере ничего не изменится."):
+        return
+    await cb_server_delok(call, callback_data, state, db, service)
 
 
 @router.callback_query(ASrv.filter(F.action == "delok"))
@@ -1615,6 +1675,10 @@ async def cb_relay_main(call: CallbackQuery, callback_data: ARelay, db: Database
     relay = await _relay_or_alert(call, db, callback_data.id)
     if relay is None:
         return
+    if not await confirm_tap(
+        call, f"Сделать «{relay.name}» основным входом? Старые ключи для белых списков у клиентов перестанут подходить."
+    ):
+        return
     await db.set_main_relay(relay.id)
     await call.answer("Теперь это основной вход")
     text, kb = await relay_card(db, await db.get_relay(relay.id))
@@ -1636,28 +1700,24 @@ async def cb_relay_resetkey(call: CallbackQuery, callback_data: ARelay, db: Data
     except ValueError:
         await call.answer("Это не SSH-подключение", show_alert=True)
         return
+    if not await confirm_tap(
+        call, "Забыть SSH-ключ входа? Делайте это, только если сами переустанавливали сервер — иначе это может быть подмена."
+    ):
+        return
     service.pool.ssh.forget(host, port)
     await service._drop_relay(relay.id)
     await call.answer("Ключ сервера забыт — при следующем подключении будет запомнен новый", show_alert=True)
 
 
 @router.callback_query(ARelay.filter(F.action == "del"))
-async def cb_relay_del(call: CallbackQuery, callback_data: ARelay, db: Database) -> None:
+async def cb_relay_del(call: CallbackQuery, callback_data: ARelay, state: FSMContext, db: Database, service: VpnService) -> None:
     relay = await _relay_or_alert(call, db, callback_data.id)
     if relay is None:
         return
-    await call.answer()
-    warn = (
-        "\n\n⚠️ Это основной вход: ключи для белых списков у клиентов перестанут работать. "
-        "Основным станет следующий вход (если есть) — разошлите ключи заново."
-        if relay.is_main
-        else ""
-    )
-    await edit_or_send(
-        call,
-        f"Удалить вход {esc(relay.name)}? Бот уберёт с него свои правила перенаправления.{warn}",
-        ikb([[("🗑 Да, удалить", ARelay(action="delok", id=relay.id).pack()), back(ARelay(action="view", id=relay.id), "Отмена")]]),
-    )
+    warn = " Это основной вход — ключи для белых списков у клиентов перестанут работать." if relay.is_main else ""
+    if not await confirm_tap(call, f"Удалить вход «{relay.name}»?{warn}"):
+        return
+    await cb_relay_delok(call, callback_data, state, db, service)
 
 
 @router.callback_query(ARelay.filter(F.action == "delok"))
@@ -1753,13 +1813,13 @@ async def cmd_inactive(message: Message, command: CommandObject, db: Database) -
 
 
 @router.callback_query(Adm.filter(F.action == "inactdel"))
-async def cb_inactive_del(call: CallbackQuery, callback_data: Adm) -> None:
-    await call.answer()
-    await edit_or_send(
-        call,
-        f"Точно удалить все неактивные аккаунты ({days_word(callback_data.arg)})? Их ключи будут удалены с сервера.",
-        ikb([[("🗑 Да, удалить", Adm(action="inactdelok", arg=callback_data.arg).pack()), back(Adm(action="inactive", arg=callback_data.arg), "Отмена")]]),
-    )
+async def cb_inactive_del(call: CallbackQuery, callback_data: Adm, bot: Bot, db: Database, service: VpnService) -> None:
+    n = len(await db.inactive_users(callback_data.arg))
+    if not await confirm_tap(
+        call, f"Удалить {n} неактивных аккаунтов ({days_word(callback_data.arg)})? Их ключи удалятся с серверов. Отменить нельзя."
+    ):
+        return
+    await cb_inactive_delok(call, callback_data, bot, db, service)
 
 
 @router.callback_query(Adm.filter(F.action == "inactdelok"))
