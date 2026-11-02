@@ -160,6 +160,7 @@ _MIGRATIONS = {
     },
     "servers": {
         "protocols": "TEXT NOT NULL DEFAULT ''",  # найденные на сервере: «awg,vless»
+        "hidden": "TEXT NOT NULL DEFAULT ''",  # скрытые для новых устройств: «vless» (старые работают)
     },
     "payments": {
         "server_id": "INTEGER",
@@ -229,6 +230,7 @@ class Server:
     last_error: str | None
     last_check: int
     protocols: str
+    hidden: str = ""
 
     @property
     def title(self) -> str:
@@ -237,6 +239,15 @@ class Server:
     @property
     def protocol_list(self) -> list[str]:
         return [p for p in self.protocols.split(",") if p in PROTOCOLS]
+
+    @property
+    def hidden_list(self) -> list[str]:
+        return [p for p in self.hidden.split(",") if p in PROTOCOLS]
+
+    @property
+    def visible_protocols(self) -> list[str]:
+        """Протоколы, которые предлагаются для новых устройств."""
+        return [p for p in self.protocol_list if p not in self.hidden_list]
 
 
 @dataclass

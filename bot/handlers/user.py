@@ -43,6 +43,7 @@ from .keyboards import (
     DevProto,
     Loc,
     Menu,
+    PSw,
     PayCheck,
     back,
     ikb,
@@ -254,7 +255,7 @@ async def cb_add_device(
 
 
 async def _ask_protocol(call: CallbackQuery, state: FSMContext, server) -> None:
-    protocols = server.protocol_list
+    protocols = server.visible_protocols
     if len(protocols) == 1:
         await _ask_device_name(call, state, server.id, protocols[0])
         return
@@ -386,6 +387,8 @@ async def cb_device_view(call: CallbackQuery, callback_data: Dev, db: Database, 
     )
     others = [s for s in await service.available_servers(key.protocol) if s.id != key.server_id]
     whitelist = await service.whitelist_route(key) is not None
+    switch = await service.protocol_options(key)
+    other = "vless" if key.protocol == "awg" else "awg"
     if whitelist:
         text += (
             "\n\n🛡 Если VPN не подключается из-за белых списков (мобильный интернет пускает только "
@@ -397,6 +400,7 @@ async def cb_device_view(call: CallbackQuery, callback_data: Dev, db: Database, 
             [("📤 Получить ключ", Dev(action="key", id=key.id).pack())],
             [("🛡 Ключ для белых списков", Dev(action="wl", id=key.id).pack())] if whitelist else [],
             [("🌍 Сменить локацию", Loc(action="pick", key=key.id, sid=0).pack())] if others else [],
+            [(f"🔄 Сменить протокол на {PROTOCOLS[other]}", PSw(key=key.id).pack())] if switch else [],
             [("✏️ Переименовать", Dev(action="ren", id=key.id).pack()), ("🗑 Удалить", Dev(action="del", id=key.id).pack())],
             [back(Menu(action="devices"))],
         ]
@@ -447,6 +451,58 @@ async def cb_move_device(
         note = "\nКлюч для белых списков у перенесённого устройства тоже новый — возьмите его в карточке устройства."
     await edit_or_send(
         call, f"✅ Устройство перенесено: {esc(rk.location)}. Добавьте новый ключ в приложение:{note}"
+    )
+    await deliver_key(bot, call.from_user.id, rk)
+
+
+@router.callback_query(PSw.filter())
+async def cb_switch_protocol(
+    call: CallbackQuery, callback_data: PSw, bot: Bot, db: Database, service: VpnService, user: User
+) -> None:
+    key = await _own_key(call, db, user, callback_data.key)
+    if key is None:
+        return
+    other = "vless" if key.protocol == "awg" else "awg"
+    options = await service.protocol_options(key)
+    if not options:
+        await call.answer(f"{PROTOCOLS[other]} сейчас недоступен", show_alert=True)
+        return
+    if not callback_data.sid:
+        await call.answer()
+        rows = [
+            [(
+                f"{PROTO_ICONS.get(other, '')} {PROTOCOLS[other]} · {s.title}"
+                + (" (тот же сервер)" if s.id == key.server_id else ""),
+                PSw(key=key.id, sid=s.id).pack(),
+            )]
+            for s in options
+        ]
+        rows.append([back(Dev(action="view", id=key.id), "Отмена")])
+        await edit_or_send(
+            call,
+            f"🔄 Перевести <b>{esc(key.name)}</b> с {key.protocol_name} на <b>{PROTOCOLS[other]}</b>?\n\n"
+            "Устройство и слот останутся, но придёт <b>новый ключ</b> — старое подключение в приложении "
+            "перестанет работать, его нужно будет удалить и добавить новое.",
+            ikb(rows),
+        )
+        return
+    if callback_data.sid not in {s.id for s in options}:
+        await call.answer("Этот сервер сейчас недоступен", show_alert=True)
+        return
+    await call.answer("Меняю протокол…")
+    try:
+        rk = await service.change_protocol(key, other, callback_data.sid)
+    except ServiceError as e:
+        await call.message.answer(f"❌ {e}")
+        return
+    except AwgError:
+        log.exception("Ошибка смены протокола")
+        await call.message.answer("❌ Сервер не отвечает, попробуйте позже.")
+        return
+    await edit_or_send(
+        call,
+        f"✅ {esc(key.name)} теперь на {PROTOCOLS[other]}. Удалите старое подключение в приложении "
+        "и добавьте новый ключ:",
     )
     await deliver_key(bot, call.from_user.id, rk)
 

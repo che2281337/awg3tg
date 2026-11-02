@@ -84,6 +84,13 @@ class ASlot(CallbackData, prefix="asl"):
     arg: int = 0
 
 
+class PSw(CallbackData, prefix="psw"):
+    """Смена протокола устройства key: sid=0 — выбрать, иначе перевести на сервер sid."""
+
+    key: int
+    sid: int = 0
+
+
 class DevProto(CallbackData, prefix="dp"):
     """Выбор протокола для нового устройства на сервере sid."""
 

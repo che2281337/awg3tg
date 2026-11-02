@@ -233,6 +233,30 @@ class XrayServer(ContainerClient):
                 await self._table_add(client_id, client_name)
             return client_id, info
 
+    async def add_clients(self, clients: list[tuple[str, str]]) -> int:
+        """Добавляет сразу нескольких клиентов [(имя, UUID)] — один перезапуск контейнера.
+        Возвращает, сколько реально добавлено (уже существующие пропускаются)."""
+        async with self._lock:
+            cfg = await self.load_config()
+            info = await self.info(cfg)
+            current = (_inbound(cfg).setdefault("settings", {}).setdefault("clients", []))
+            have = {c.get("id") for c in current}
+            added = []
+            for name, client_id in clients:
+                if client_id in have:
+                    continue
+                entry = {"id": client_id, "email": client_id}
+                if info.flow:
+                    entry["flow"] = info.flow
+                current.append(entry)
+                have.add(client_id)
+                added.append((name, client_id))
+            if added:
+                await self._save(cfg)
+                for name, client_id in added:
+                    await self._table_add(client_id, name)
+            return len(added)
+
     async def remove_clients(self, client_ids: set[str]) -> int:
         """Удаляет сразу нескольких клиентов — один перезапуск контейнера."""
         async with self._lock:

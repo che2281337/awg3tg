@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import ipaddress
 import logging
@@ -117,6 +118,7 @@ class ServerCheck:
     changed: bool  # статус изменился с прошлой проверки
     error: str = ""
     protocols: tuple[str, ...] = ()
+    restored: int = 0  # сколько ключей бот вернул на сервер (их стёрли, например переустановкой)
 
 
 def validate_conn(conn: str) -> str:
@@ -203,6 +205,9 @@ class VpnService:
         self.yoomoney_wallet = settings.yoomoney_wallet
         self._relay_clients: dict[int, RelayClient] = {}
         self._relay_lock = asyncio.Lock()
+        # Ключи, с которыми прямо сейчас идёт операция (удаление, отключение, перенос…):
+        # проверка сервера не должна «восстанавливать» их посреди операции.
+        self._busy: dict[int, int] = {}  # key_id -> сколько операций идёт
 
     # ---------- запуск ----------
 
@@ -287,13 +292,30 @@ class VpnService:
 
     async def available_servers(self, protocol: str | None = None) -> list[Server]:
         """Локации, которые можно выбрать (для нового устройства — с нужным протоколом)."""
-        rows = [s for s in await self.db.servers(only_active=True) if s.status_ok and s.protocol_list]
+        rows = [s for s in await self.db.servers(only_active=True) if s.status_ok and s.visible_protocols]
         if protocol:
-            rows = [s for s in rows if protocol in s.protocol_list]
+            rows = [s for s in rows if protocol in s.visible_protocols]
         return rows
 
+    async def set_protocol_hidden(self, row: Server, protocol: str, hidden: bool) -> None:
+        """Скрыть протокол сервера для новых устройств (существующие продолжают работать)."""
+        current = set(row.hidden_list)
+        current = current | {protocol} if hidden else current - {protocol}
+        await self.db.update_server(row.id, hidden=",".join(p for p in PROTOCOLS if p in current))
+
+    @contextlib.asynccontextmanager
+    async def _busy_key(self, key_id: int):
+        self._busy[key_id] = self._busy.get(key_id, 0) + 1
+        try:
+            yield
+        finally:
+            if self._busy[key_id] <= 1:
+                del self._busy[key_id]
+            else:
+                self._busy[key_id] -= 1
+
     async def check_server(self, row: Server) -> ServerCheck:
-        found, errors = [], []
+        found, errors, restored = [], [], 0
         for proto in PROTOCOLS:
             try:
                 client = await self.pool.get(row, proto)
@@ -301,7 +323,7 @@ class VpnService:
                     await client.server_info()
                 else:
                     await client.info()
-                await self._reconcile(row, proto, client)
+                restored += await self._reconcile(row, proto, client)
                 found.append(proto)
             except Exception as e:  # сеть, SSH, docker — протокол недоступен
                 errors.append(f"{PROTOCOLS[proto]}: {e}")
@@ -312,32 +334,69 @@ class VpnService:
         lost = [p for p in row.protocol_list if p not in found]
         error = "; ".join(errors) if (not ok or lost) else ""
         changed = await self._mark(row, ok, error, found)
-        return ServerCheck(row, ok, changed, error, tuple(found))
+        return ServerCheck(row, ok, changed, error, tuple(found), restored)
 
     async def check_servers(self) -> list[ServerCheck]:
         rows = await self.db.servers()
         return list(await asyncio.gather(*(self.check_server(r) for r in rows)))
 
-    async def _reconcile(self, row: Server, protocol: str, client) -> None:
-        """Снимает с сервера ключи, которые по базе должны быть выключены или перенесены
-        (если в момент отключения сервер был недоступен). Чужие ключи не трогает."""
+    async def _reconcile(self, row: Server, protocol: str, client) -> int:
+        """Приводит сервер в соответствие с базой:
+        * снимает ключи, которые по базе выключены или перенесены (если в момент отключения
+          сервер был недоступен). Чужие ключи (не из бота) не трогает;
+        * возвращает ключи, которые по базе должны работать, но на сервере пропали — например,
+          протокол переустановили в приложении Amnezia. Возвращает, сколько ключей вернул."""
         cfg = await client.load_config()
         ids = [p.get("PublicKey") for p in cfg.peers] if protocol == "awg" else client.client_ids(cfg)
+        present = {cid for cid in ids if cid}
         extra = set()
-        for cid in ids:
-            if not cid:
-                continue
+        for cid in present:
             key = await self.db.key_by_public(cid)
-            if key is not None and (key.server_id != row.id or not key.enabled or key.protocol != protocol):
+            if key is not None and key.id not in self._busy and (
+                key.server_id != row.id or not key.enabled or key.protocol != protocol
+            ):
                 extra.add(cid)
-        if not extra:
-            return
-        log.info("Сервер %s: снимаю лишние ключи %s (%s)", row.title, PROTOCOLS[protocol], len(extra))
-        if protocol == "awg":
-            for cid in extra:
-                await client.remove_peer(cid)
-        else:
-            await client.remove_clients(extra)
+        if extra:
+            log.info("Сервер %s: снимаю лишние ключи %s (%s)", row.title, PROTOCOLS[protocol], len(extra))
+            if protocol == "awg":
+                for cid in extra:
+                    await client.remove_peer(cid)
+            else:
+                await client.remove_clients(extra)
+        missing = [
+            k
+            for k in await self.db.enabled_keys(row.id, protocol)
+            if k.public_key not in present and k.id not in self._busy
+        ]
+        if not missing:
+            return 0
+        log.warning("Сервер %s: на нём нет %s ключей %s — возвращаю", row.title, len(missing), PROTOCOLS[protocol])
+        names = {}
+        for k in missing:
+            user = await self.db.get_user(k.tg_id) if k.tg_id else None
+            names[k.id] = self._peer_name(user, k.name)
+        if protocol == "vless":
+            return await client.add_clients([(names[k.id], k.public_key) for k in missing])
+        restored = 0
+        for k in missing:
+            fresh = await self.db.get_key(k.id)  # пока шли по списку, ключ могли удалить или выключить
+            if fresh is None or not fresh.enabled or fresh.server_id != row.id or fresh.id in self._busy:
+                continue
+            others = await self.db.other_ips(row.id, k.id)
+            ip = k.ip if k.ip and k.ip not in others else None
+            peer, _ = await client.add_peer(names[k.id], keypair=(k.private_key, k.public_key), ip=ip, reserved=others)
+            if peer.ip != k.ip:
+                await self.db.update_key(k.id, ip=peer.ip)
+            restored += 1
+        return restored
+
+    async def check_duplicate(self, host: str, conn: str, exclude_id: int = 0) -> None:
+        """Одна машина — одна запись: две записи на один сервер стали бы снимать друг у друга клиентов."""
+        for s in await self.db.servers():
+            if s.id == exclude_id:
+                continue
+            if conn == s.conn or (host and host == s.host):
+                raise ServiceError(f"Этот сервер уже добавлен: {s.title} ({s.host}, {s.conn}).")
 
     async def add_server(self, name: str, flag: str, host: str, conn: str, container: str | None = None) -> Server:
         try:
@@ -348,6 +407,7 @@ class VpnService:
             host = parse_ssh_target(conn)[1]
         if not host:
             host = await asyncio.to_thread(detect_public_ip)
+        await self.check_duplicate(host, conn)
         probe = Server(0, name, flag, host, conn, container, 1, 0, now(), 1, None, 0, "")
         protocols, error = await self._probe(probe)
         if not protocols:
@@ -621,7 +681,7 @@ class VpnService:
             row = await self.db.get_server(server_id)
             if row is None or (not force and not (row.active and row.status_ok)):
                 raise ServiceError("Эта локация сейчас недоступна, выберите другую.")
-            if protocol not in row.protocol_list:
+            if protocol not in (row.protocol_list if force else row.visible_protocols):
                 raise ServiceError(f"{PROTOCOLS[protocol]} на этом сервере сейчас недоступен.")
             row, client = await self._client(row.id, protocol)
             peer_name = self._peer_name(user, name)
@@ -652,20 +712,26 @@ class VpnService:
             await client.remove_peer(key.public_key)
 
     async def delete_device(self, key: Key) -> None:
-        if key.enabled:
-            await self._remove_from_server(key)
-        await self.db.delete_key(key.id)
+        async with self._busy_key(key.id):
+            if key.enabled:
+                await self._remove_from_server(key)
+            await self.db.delete_key(key.id)
 
     async def rename_device(self, key: Key, name: str) -> None:
         await self.db.update_key(key.id, name=name[:40])
 
     async def disable_key(self, key: Key) -> None:
-        if key.enabled:
-            await self._remove_from_server(key)
-        await self.db.update_key(key.id, enabled=0, last_rx=0, last_tx=0)
+        async with self._busy_key(key.id):
+            if key.enabled:
+                await self._remove_from_server(key)
+            await self.db.update_key(key.id, enabled=0, last_rx=0, last_tx=0)
 
     async def enable_key(self, key: Key, user: User | None = None) -> bool:
         """Возвращает True, если у ключа сменился IP (клиенту нужно получить ключ заново)."""
+        async with self._busy_key(key.id):
+            return await self._enable_key(key, user)
+
+    async def _enable_key(self, key: Key, user: User | None) -> bool:
         row, client = await self._client(key.server_id, key.protocol)
         if key.protocol == "vless":
             await client.add_client(self._peer_name(user, key.name), key.public_key)
@@ -687,10 +753,10 @@ class VpnService:
         target = await self.db.get_server(server_id)
         if target is None or (not force and not (target.active and target.status_ok)):
             raise ServiceError("Эта локация сейчас недоступна, выберите другую.")
-        if key.protocol not in target.protocol_list:
+        if key.protocol not in (target.protocol_list if force else target.visible_protocols):
             raise ServiceError(f"На этом сервере нет {key.protocol_name}.")
         user = await self.db.get_user(key.tg_id) if key.tg_id else None
-        async with self._lock:
+        async with self._lock, self._busy_key(key.id):
             # Сначала поднимаем ключ на новом сервере — если он недоступен, ничего не ломаем.
             row, client = await self._client(target.id, key.protocol)
             name = self._peer_name(user, key.name)
@@ -719,6 +785,70 @@ class VpnService:
         if key.protocol == "vless":
             return self._rendered_vless(moved, row, info)
         return self._rendered_awg(moved, row, info)
+
+    async def change_protocol(
+        self, key: Key, protocol: str, server_id: int | None = None, *, force: bool = False
+    ) -> RenderedKey:
+        """Перевод устройства на другой протокол (и, если нужно, на другой сервер).
+        Устройство, его слот и история трафика сохраняются, но ключ новый: у AWG и VLESS
+        разные учётные данные, поэтому старый ключ в приложении перестаёт работать."""
+        if protocol not in PROTOCOLS:
+            raise ServiceError("Неизвестный протокол.")
+        if protocol == key.protocol:
+            raise ServiceError(f"Устройство уже на {key.protocol_name}.")
+        target = await self.db.get_server(server_id or key.server_id) if (server_id or key.server_id) else None
+        if target is None or (not force and not (target.active and target.status_ok)):
+            raise ServiceError("Эта локация сейчас недоступна, выберите другую.")
+        if protocol not in (target.protocol_list if force else target.visible_protocols):
+            raise ServiceError(f"{PROTOCOLS[protocol]} на этом сервере сейчас недоступен.")
+        user = await self.db.get_user(key.tg_id) if key.tg_id else None
+        async with self._lock, self._busy_key(key.id):
+            row, client = await self._client(target.id, protocol)
+            name = self._peer_name(user, key.name)
+            if protocol == "vless":
+                client_id, info = await client.add_client(name, new_client_id())
+                creds = {"public_key": client_id, "private_key": "", "ip": ""}
+            else:
+                peer, info = await client.add_peer(name, reserved=await self.db.reserved_ips(row.id))
+                creds = {"public_key": peer.public_key, "private_key": peer.private_key, "ip": peer.ip}
+            if key.enabled:
+                # Старые учётные данные исчезнут из базы — снять их потом будет некому,
+                # поэтому если старый сервер не отвечает, отменяем смену целиком.
+                try:
+                    await self._remove_from_server(key)
+                except (AwgError, ServiceError) as e:
+                    await self._drop_new_creds(client, protocol, creds["public_key"])
+                    raise ServiceError("Сервер устройства сейчас не отвечает, попробуйте чуть позже.") from e
+            await self.db.update_key(
+                key.id, **creds, protocol=protocol, server_id=row.id, enabled=1,
+                last_rx=0, last_tx=0, last_handshake=0,
+            )
+            changed = await self.db.get_key(key.id)
+            assert changed
+            # Отключённое (нет подписки / сверх лимита) устройство остаётся отключённым.
+            if not key.enabled or (user is not None and not self.has_access(user)):
+                await self.disable_key(changed)
+                changed = await self.db.get_key(key.id)
+                assert changed
+        if protocol == "vless":
+            return self._rendered_vless(changed, row, info)
+        return self._rendered_awg(changed, row, info)
+
+    @staticmethod
+    async def _drop_new_creds(client, protocol: str, cid: str) -> None:
+        try:
+            if protocol == "vless":
+                await client.remove_client(cid)
+            else:
+                await client.remove_peer(cid)
+        except AwgError as e:
+            log.warning("Не удалось откатить новый ключ %s: %s", cid, e)
+
+    async def protocol_options(self, key: Key) -> list[Server]:
+        """Серверы, на которые можно перевести устройство другим протоколом (текущий — первым)."""
+        other = "vless" if key.protocol == "awg" else "awg"
+        rows = await self.available_servers(other)
+        return sorted(rows, key=lambda s: s.id != key.server_id)
 
     async def sync_user(self, tg_id: int) -> list[Key]:
         """Приводит ключи на серверах в соответствие с подпиской и лимитом устройств.

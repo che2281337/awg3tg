@@ -16,7 +16,7 @@ from aiogram import Bot
 from aiogram.types import BufferedInputFile
 
 from .db import now
-from .handlers.keyboards import SlotCb, ikb, renew_kb, slot_kb
+from .handlers.keyboards import ASrv, SlotCb, ikb, renew_kb, slot_kb
 from .service import VpnService
 from .utils import esc, fmt_dt, left_str
 from .yoomoney import YooMoneyError
@@ -108,6 +108,16 @@ async def remind_expiring(bot: Bot, service: VpnService) -> None:
 async def check_servers(bot: Bot, service: VpnService) -> None:
     """Проверка серверов и входов для белых списков; админам — уведомление при смене статуса."""
     for c in await service.check_servers():
+        if c.restored:
+            text = (
+                f"♻️ На сервере {esc(c.server.title)} пропали ключи клиентов ({c.restored}) — бот вернул их.\n\n"
+                "Так бывает, если протокол переустановили или сбросили в приложении Amnezia. При переустановке "
+                "меняются ключи самого сервера, и старые ключи у клиентов перестают работать — "
+                "разошлите им новые (кнопка ниже или в карточке сервера)."
+            )
+            kb = ikb([[("📨 Разослать новые ключи", ASrv(action="keys", id=c.server.id).pack())]])
+            for admin_id in service.settings.admin_ids:
+                await _safe_send(bot, admin_id, text, reply_markup=kb)
         if not c.changed:
             continue
         if c.ok:

@@ -1034,7 +1034,7 @@ async def cb_servers(call: CallbackQuery, state: FSMContext, db: Database) -> No
     for s in servers:
         total, _, online = counts.get(s.id, (0, 0, 0))
         mark = ("🟢" if s.status_ok else "🔴") + ("" if s.active else "🙈")
-        protos = "+".join(PROTO_SHORT[p] for p in s.protocol_list) or "—"
+        protos = "+".join(PROTO_SHORT[p] + ("🙈" if p in s.hidden_list else "") for p in s.protocol_list) or "—"
         label = f"{mark} {s.title} · {protos} · {total} устр. · онлайн {online}"
         lines.append(esc(label))
         rows.append([(label, ASrv(action="view", id=s.id).pack())])
@@ -1072,17 +1072,29 @@ async def server_card(db: Database, service: VpnService, row) -> tuple[str, obje
     details = await service.server_details(row) if row.status_ok else {}
     lines.append("\n<b>Протоколы:</b>")
     for proto, title in PROTOCOLS.items():
+        hidden = " — 🙈 скрыт для новых устройств" if proto in row.hidden_list else ""
         if proto in details:
-            lines.append(f"✅ {title}: {esc(details[proto])}")
+            lines.append(f"✅ {title}: {esc(details[proto])}{hidden}")
         else:
             lines.append(f"— {title}: не найден на сервере")
     lines += [
         f"\n📶 Трафик сегодня: {human_bytes(t_today.total)}, за месяц: {human_bytes(t_month.total)}",
     ]
     a = lambda action, arg=0: ASrv(action=action, id=row.id, arg=arg).pack()  # noqa: E731
+    proto_rows = [
+        (
+            (f"👁 Показать {PROTO_SHORT[p]}", a("show", i))
+            if p in row.hidden_list
+            else (f"🙈 Скрыть {PROTO_SHORT[p]}", a("hide", i))
+        )
+        for i, p in enumerate(PROTOCOLS)
+        if p in row.protocol_list
+    ]
     rows = [
         [("🔄 Проверить", a("check")), ("✏️ Изменить", a("edit"))],
-        [("🙈 Скрыть для новых" if row.active else "👁 Показывать клиентам", a("toggle"))],
+        [("🙈 Скрыть сервер для новых" if row.active else "👁 Показывать сервер клиентам", a("toggle"))],
+        proto_rows if len(row.protocol_list) > 1 or row.hidden_list else [],
+        [("📨 Разослать новые ключи", a("keys"))] if enabled else [],
         [("🚚 Перенести всех клиентов", a("moveall"))] if total else [],
         [("🔑 Сбросить SSH-ключ сервера", a("resetkey"))] if not row.conn.startswith(("local", "mock:")) else [],
         [("🗑 Удалить сервер", a("del"))],
@@ -1213,6 +1225,7 @@ async def st_server(message: Message, state: FSMContext, db: Database, service: 
                 return
             from ..service import validate_conn
 
+            await service.check_duplicate(host, validate_conn(conn), exclude_id=row.id)
             await service.update_server(row, name=name, flag=flag, host=host, conn=validate_conn(conn))
             row = await db.get_server(row.id)
             res = await service.check_server(row)
@@ -1225,6 +1238,117 @@ async def st_server(message: Message, state: FSMContext, db: Database, service: 
         return
     await state.clear()
     await wait.edit_text(result, reply_markup=ikb([[("🖥 Серверы", ASrv(action="list").pack())]]))
+
+
+@router.callback_query(ASrv.filter(F.action.in_({"hide", "show"})))
+async def cb_server_proto_hide(call: CallbackQuery, callback_data: ASrv, db: Database, service: VpnService) -> None:
+    row = await _server_or_alert(call, db, callback_data.id)
+    if row is None:
+        return
+    protos = list(PROTOCOLS)
+    if not 0 <= callback_data.arg < len(protos):
+        await call.answer()
+        return
+    proto = protos[callback_data.arg]
+    hide = callback_data.action == "hide"
+    await service.set_protocol_hidden(row, proto, hide)
+    await call.answer(
+        f"{PROTOCOLS[proto]} скрыт для новых устройств — у кого он уже есть, всё работает"
+        if hide
+        else f"{PROTOCOLS[proto]} снова доступен для новых устройств",
+        show_alert=hide,
+    )
+    text, kb = await server_card(db, service, await db.get_server(row.id))
+    await edit_or_send(call, text, kb)
+
+
+async def _server_targets(db: Database, service: VpnService, server_id: int) -> list[tuple[User, list]]:
+    """Клиенты с доступом и их включённые устройства на этом сервере."""
+    by_user: dict[int, list] = {}
+    for k in await db.server_keys(server_id):
+        if k.enabled and k.tg_id:
+            by_user.setdefault(k.tg_id, []).append(k)
+    result = []
+    for uid, keys in by_user.items():
+        user = await db.get_user(uid)
+        if user is not None and not user.banned and service.has_access(user):
+            result.append((user, keys))
+    return result
+
+
+@router.callback_query(ASrv.filter(F.action == "keys"))
+async def cb_server_keys(call: CallbackQuery, callback_data: ASrv, db: Database, service: VpnService) -> None:
+    row = await _server_or_alert(call, db, callback_data.id)
+    if row is None:
+        return
+    targets = await _server_targets(db, service, row.id)
+    await call.answer()
+    await edit_or_send(
+        call,
+        f"📨 Разослать клиентам {esc(row.title)} их актуальные ключи?\n\n"
+        f"Получат: {len(targets)} чел., устройств: {sum(len(k) for _, k in targets)}.\n\n"
+        "Нужно после смены IP/домена сервера или переустановки и смены настроек AWG / XRay в приложении "
+        "Amnezia — тогда старые ключи у клиентов не работают. Клиенты получат ключи с пояснением, "
+        "что старое подключение в приложении нужно заменить.",
+        ikb([[("📨 Да, разослать", ASrv(action="keysok", id=row.id).pack()), back(ASrv(action="view", id=row.id), "Отмена")]]),
+    )
+
+
+@router.callback_query(ASrv.filter(F.action == "keysok"))
+async def cb_server_keysok(call: CallbackQuery, callback_data: ASrv, bot: Bot, db: Database, service: VpnService) -> None:
+    row = await _server_or_alert(call, db, callback_data.id)
+    if row is None:
+        return
+    targets = await _server_targets(db, service, row.id)
+    await call.answer("Отправляю…")
+    status = await call.message.answer(f"📤 Отправляю новые ключи {len(targets)} пользователям…")
+    intro = (
+        f"🔄 <b>Обновлены настройки сервера {esc(row.title)}</b>\n\n"
+        "Старое подключение в приложении больше не работает. Удалите его и добавьте новый ключ ниже "
+        "(«Добавить сервер» → «Вставить ключ»)."
+    )
+    _start_key_mailing(bot, service, targets, intro, False, status, ASrv(action="view", id=row.id).pack())
+
+
+_MAILING_TASKS: set[asyncio.Task] = set()
+
+
+def _start_key_mailing(bot: Bot, service: VpnService, targets, intro: str, whitelist: bool, status, back_cb: str) -> None:
+    """Фоновая рассылка ключей: каждому пользователю — пояснение и ключи его устройств."""
+
+    async def run() -> None:
+        users_ok = keys_ok = failed = 0
+        for user, keys in targets:
+            sent = 0
+            try:
+                await bot.send_message(user.tg_id, intro)
+                for key in keys:
+                    try:
+                        await deliver_key(bot, user.tg_id, await service.render(key, whitelist=whitelist))
+                        sent += 1
+                    except (ServiceError, AwgError) as e:
+                        log.warning("Рассылка ключей: устройство #%s: %s", key.id, e)
+                        failed += 1
+                    await asyncio.sleep(0.2)
+            except Exception:
+                failed += 1  # заблокировал бота и т.п.
+            if sent:
+                users_ok += 1
+                keys_ok += sent
+            await asyncio.sleep(0.3)  # лимиты Telegram
+        try:
+            await status.edit_text(
+                f"✅ Готово: {users_ok} пользователям отправлено ключей: {keys_ok}"
+                + (f", ошибок: {failed}" if failed else "")
+                + ".",
+                reply_markup=ikb([[("⬅️ Назад", back_cb)]]),
+            )
+        except Exception:
+            pass
+
+    task = asyncio.create_task(run())
+    _MAILING_TASKS.add(task)
+    task.add_done_callback(_MAILING_TASKS.discard)
 
 
 @router.callback_query(ASrv.filter(F.action == "del"))
@@ -1312,9 +1436,6 @@ async def cb_server_moveallok(call: CallbackQuery, callback_data: ASrv, bot: Bot
 #
 # Входной сервер в РФ просто перенаправляет пакеты на зарубежные серверы. Клиенты получают
 # дополнительный «ключ для белых списков» (тот же ключ, другой адрес) — без лишнего слота.
-
-_RELAY_TASKS: set[asyncio.Task] = set()
-
 
 def _relay_help(pubkey: str) -> str:
     return (
@@ -1589,44 +1710,13 @@ async def cb_relay_sendok(call: CallbackQuery, callback_data: ARelay, bot: Bot, 
     targets = await _whitelist_targets(db, service)
     await call.answer("Отправляю…")
     status = await call.message.answer(f"📤 Отправляю ключи для белых списков {len(targets)} пользователям…")
-
-    async def run() -> None:
-        users_ok = keys_ok = failed = 0
-        for user, keys in targets:
-            sent = 0
-            try:
-                await bot.send_message(
-                    user.tg_id,
-                    "🛡 <b>Ключи для белых списков</b>\n\n"
-                    "Если мобильный интернет пускает только разрешённые сайты и VPN не подключается — "
-                    "используйте ключи ниже. Добавьте их в приложение <b>вторым подключением</b> (обычные не удаляйте) "
-                    "и переключайтесь на них, когда обычное подключение не работает.",
-                )
-                for key in keys:
-                    try:
-                        await deliver_key(bot, user.tg_id, await service.render(key, whitelist=True))
-                        sent += 1
-                    except (ServiceError, AwgError) as e:
-                        log.warning("Ключ для белых списков #%s: %s", key.id, e)
-                        failed += 1
-                    await asyncio.sleep(0.2)
-            except Exception:
-                failed += 1  # заблокировал бота и т.п.
-            if sent:
-                users_ok += 1
-                keys_ok += sent
-            await asyncio.sleep(0.3)  # лимиты Telegram
-        try:
-            await status.edit_text(
-                f"✅ Готово: {users_ok} пользователям отправлено {keys_ok} ключей" + (f", ошибок: {failed}" if failed else "") + ".",
-                reply_markup=ikb([[("🛡 К входу", ARelay(action="view", id=relay.id).pack())]]),
-            )
-        except Exception:
-            pass
-
-    task = asyncio.create_task(run())
-    _RELAY_TASKS.add(task)
-    task.add_done_callback(_RELAY_TASKS.discard)
+    intro = (
+        "🛡 <b>Ключи для белых списков</b>\n\n"
+        "Если мобильный интернет пускает только разрешённые сайты и VPN не подключается — "
+        "используйте ключи ниже. Добавьте их в приложение <b>вторым подключением</b> (обычные не удаляйте) "
+        "и переключайтесь на них, когда обычное подключение не работает."
+    )
+    _start_key_mailing(bot, service, targets, intro, True, status, ARelay(action="view", id=relay.id).pack())
 
 
 # ---------- неактивные аккаунты ----------
