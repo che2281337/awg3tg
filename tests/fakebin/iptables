@@ -1,0 +1,19 @@
+#!/bin/bash
+# Фейковый iptables для тестов: правила хранятся в $FAKE_ROOT/iptables.rules
+f="$FAKE_ROOT/iptables.rules"
+touch "$f"
+echo "$*" >> "$FAKE_ROOT/iptables.log"
+table=filter
+if [ "$1" = "-t" ]; then table=$2; shift 2; fi
+op=$1; chain=$2; shift 2
+rest="$*"
+case "$op" in
+  -N) grep -qxF "N $table $chain" "$f" && exit 1; echo "N $table $chain" >> "$f" ;;
+  -F) grep -q "^N $table $chain\$" "$f" || exit 1; grep -v "^A $table $chain " "$f" > "$f.tmp"; mv "$f.tmp" "$f" ;;
+  -X) grep -vxF "N $table $chain" "$f" > "$f.tmp"; mv "$f.tmp" "$f" ;;
+  -C) grep -qxF "A $table $chain $rest" "$f" ;;
+  -I|-A) echo "A $table $chain $rest" >> "$f" ;;
+  -D) grep -qxF "A $table $chain $rest" "$f" || exit 1; grep -vxF "A $table $chain $rest" "$f" > "$f.tmp"; mv "$f.tmp" "$f" ;;
+  -S) grep -q "^N $table $chain\$" "$f" || exit 1; grep "^A $table $chain " "$f" | sed "s/^A $table /-A /" ;;
+  *) echo "fake iptables: unsupported $op" >&2; exit 2 ;;
+esac

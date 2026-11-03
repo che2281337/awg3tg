@@ -41,6 +41,13 @@ class ASrv(CallbackData, prefix="as"):
     arg: int = 0
 
 
+class ARelay(CallbackData, prefix="ar"):
+    """Админ: входы для белых списков (list | view | add | edit | sync | main | send | sendok | del | delok | resetkey)."""
+
+    action: str
+    id: int = 0
+
+
 class AMove(CallbackData, prefix="amv"):
     """Админ: перенос устройства `key` на сервер `sid` (0 — выбрать)."""
 
@@ -75,6 +82,13 @@ class ASlot(CallbackData, prefix="asl"):
     uid: int
     id: int = 0
     arg: int = 0
+
+
+class PSw(CallbackData, prefix="psw"):
+    """Смена протокола устройства key: sid=0 — выбрать, иначе перевести на сервер sid."""
+
+    key: int
+    sid: int = 0
 
 
 class DevProto(CallbackData, prefix="dp"):

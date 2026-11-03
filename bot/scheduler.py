@@ -16,7 +16,7 @@ from aiogram import Bot
 from aiogram.types import BufferedInputFile
 
 from .db import now
-from .handlers.keyboards import SlotCb, ikb, renew_kb, slot_kb
+from .handlers.keyboards import ASrv, SlotCb, ikb, renew_kb, slot_kb
 from .service import VpnService
 from .utils import esc, fmt_dt, left_str
 from .yoomoney import YooMoneyError
@@ -106,8 +106,18 @@ async def remind_expiring(bot: Bot, service: VpnService) -> None:
 
 
 async def check_servers(bot: Bot, service: VpnService) -> None:
-    """Проверка доступности серверов; админам — уведомление при смене статуса."""
+    """Проверка серверов и входов для белых списков; админам — уведомление при смене статуса."""
     for c in await service.check_servers():
+        if c.restored:
+            text = (
+                f"♻️ На сервере {esc(c.server.title)} пропали ключи клиентов ({c.restored}) — бот вернул их.\n\n"
+                "Так бывает, если протокол переустановили или сбросили в приложении Amnezia. При переустановке "
+                "меняются ключи самого сервера, и старые ключи у клиентов перестают работать — "
+                "разошлите им новые (кнопка ниже или в карточке сервера)."
+            )
+            kb = ikb([[("📨 Разослать новые ключи", ASrv(action="keys", id=c.server.id).pack())]])
+            for admin_id in service.settings.admin_ids:
+                await _safe_send(bot, admin_id, text, reply_markup=kb)
         if not c.changed:
             continue
         if c.ok:
@@ -116,6 +126,23 @@ async def check_servers(bot: Bot, service: VpnService) -> None:
             text = (
                 f"🔴 Сервер {esc(c.server.title)} недоступен!\n<code>{esc(c.error[:500])}</code>\n\n"
                 "Новым клиентам эта локация не предлагается, пока сервер не поднимется."
+            )
+        for admin_id in service.settings.admin_ids:
+            await _safe_send(bot, admin_id, text)
+
+    # Входы для белых списков: заодно перенастраиваются, если у серверов сменились порты
+    for r in await service.check_relays():
+        if not r.changed:
+            continue
+        if r.ok:
+            text = f"✅ Вход для белых списков {esc(r.relay.name)} снова работает."
+        else:
+            main = " Это основной вход — клиенты не могут подключиться через белые списки." if r.relay.is_main else ""
+            text = (
+                f"🔴 Вход для белых списков {esc(r.relay.name)} недоступен!{main}\n"
+                f"<code>{esc(r.error[:500])}</code>\n\n"
+                "Если его заблокировали — добавьте запасной вход, сделайте его основным и разошлите ключи "
+                "(🛠 Админка → 🖥 Серверы → 🛡 Входы)."
             )
         for admin_id in service.settings.admin_ids:
             await _safe_send(bot, admin_id, text)

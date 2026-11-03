@@ -16,6 +16,31 @@ log = logging.getLogger(__name__)
 
 MAX_TEXT = 4000
 
+# Подтверждение опасных действий: первое нажатие показывает всплывающее окно с вопросом,
+# повторное нажатие той же кнопки в течение CONFIRM_WINDOW секунд выполняет действие.
+CONFIRM_WINDOW = 15
+_ALERT_LIMIT = 200  # Telegram обрезает текст всплывающего окна
+_pending_confirms: dict[tuple[int, str], float] = {}
+
+
+async def confirm_tap(call: CallbackQuery, question: str) -> bool:
+    """True — действие подтверждено (кнопку нажали второй раз). False — показан вопрос."""
+    t = time.monotonic()
+    for k, ts in list(_pending_confirms.items()):
+        if t - ts > CONFIRM_WINDOW:
+            del _pending_confirms[k]
+    key = (call.from_user.id, call.data or "")
+    if key in _pending_confirms:
+        del _pending_confirms[key]
+        return True
+    _pending_confirms[key] = t
+    hint = f"\n\nНажмите кнопку ещё раз, чтобы подтвердить ({CONFIRM_WINDOW} с)."
+    question = "⚠️ " + question
+    if len(question) + len(hint) > _ALERT_LIMIT:
+        question = question[: _ALERT_LIMIT - len(hint) - 1] + "…"
+    await call.answer(question + hint, show_alert=True)
+    return False
+
 
 def help_text(support: str) -> str:
     text = (
@@ -35,6 +60,9 @@ def help_text(support: str) -> str:
         "⚡ <b>VLESS</b> — маскируется под обычный сайт, выручает, когда VPN блокируют. "
         "Кроме AmneziaVPN / DefaultVPN, работает в v2rayNG, Hiddify, Streisand, FoXray.\n\n"
         "Один ключ — одно устройство. Для телефона и компьютера добавьте отдельные устройства.\n"
+        "🛡 <b>Белые списки.</b> Если мобильный интернет пускает только разрешённые сайты и VPN не подключается — "
+        "откройте устройство и нажмите «🛡 Ключ для белых списков» (если кнопка есть). Добавьте этот ключ "
+        "вторым подключением и переключайтесь на него, когда обычное не работает.\n"
         "Если подписка закончилась, ключи отключаются, а после продления снова работают — "
         "заново ничего настраивать не нужно."
     )
@@ -128,6 +156,13 @@ async def send_long(bot: Bot, chat_id: int, text: str, **kwargs) -> None:
 async def deliver_key(bot: Bot, chat_id: int, rk: RenderedKey) -> None:
     location = f" · {esc(rk.location)}" if rk.location else ""
     header = f"🔑 <b>{esc(rk.key.name)}</b>{location} · {rk.key.protocol_name}\n\n"
+    if rk.whitelist:
+        header = (
+            f"🛡 <b>{esc(rk.key.name)} — ключ для белых списков</b>{location} · {rk.key.protocol_name}\n\n"
+            "Подключение идёт через сервер в России, поэтому работает, когда мобильный интернет пускает "
+            "только разрешённые сайты. Добавьте его в приложение <b>вторым подключением</b> (обычное не удаляйте) "
+            "и включайте, когда обычное не работает.\n\n"
+        )
     if rk.is_vless:
         await bot.send_message(
             chat_id,

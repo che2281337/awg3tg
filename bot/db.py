@@ -103,6 +103,26 @@ CREATE TABLE IF NOT EXISTS slots (
     notified   INTEGER NOT NULL DEFAULT 0        -- 1 = напомнили о конце, 2 = сообщили об окончании
 );
 CREATE INDEX IF NOT EXISTS slots_tg ON slots(tg_id, until);
+CREATE TABLE IF NOT EXISTS relays (                 -- входные серверы в РФ для белых списков
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    host       TEXT NOT NULL,                       -- адрес, который попадёт в ключи «для белых списков»
+    conn       TEXT NOT NULL,                       -- user@host:port | mock:<папка>
+    is_main    INTEGER NOT NULL DEFAULT 0,          -- 1 = через него выдаются ключи
+    created_at INTEGER NOT NULL,
+    status_ok  INTEGER NOT NULL DEFAULT 1,
+    last_error TEXT,
+    last_check INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS relay_ports (            -- какой порт входа ведёт на какой сервер
+    relay_id    INTEGER NOT NULL,
+    server_id   INTEGER NOT NULL,
+    protocol    TEXT NOT NULL,                      -- awg | vless
+    listen_port INTEGER NOT NULL,
+    target_ip   TEXT NOT NULL,
+    target_port INTEGER NOT NULL,
+    PRIMARY KEY (relay_id, server_id, protocol)
+);
 """
 
 DEFAULT_PLANS = [
@@ -140,6 +160,7 @@ _MIGRATIONS = {
     },
     "servers": {
         "protocols": "TEXT NOT NULL DEFAULT ''",  # найденные на сервере: «awg,vless»
+        "hidden": "TEXT NOT NULL DEFAULT ''",  # скрытые для новых устройств: «vless» (старые работают)
     },
     "payments": {
         "server_id": "INTEGER",
@@ -209,6 +230,7 @@ class Server:
     last_error: str | None
     last_check: int
     protocols: str
+    hidden: str = ""
 
     @property
     def title(self) -> str:
@@ -217,6 +239,46 @@ class Server:
     @property
     def protocol_list(self) -> list[str]:
         return [p for p in self.protocols.split(",") if p in PROTOCOLS]
+
+    @property
+    def hidden_list(self) -> list[str]:
+        return [p for p in self.hidden.split(",") if p in PROTOCOLS]
+
+    @property
+    def visible_protocols(self) -> list[str]:
+        """Протоколы, которые предлагаются для новых устройств."""
+        return [p for p in self.protocol_list if p not in self.hidden_list]
+
+
+@dataclass
+class Relay:
+    id: int
+    name: str
+    host: str
+    conn: str
+    is_main: int
+    created_at: int
+    status_ok: int
+    last_error: str | None
+    last_check: int
+
+    @property
+    def title(self) -> str:
+        return f"🛡 {self.name}"
+
+
+@dataclass
+class RelayPort:
+    relay_id: int
+    server_id: int
+    protocol: str
+    listen_port: int
+    target_ip: str
+    target_port: int
+
+    @property
+    def transport(self) -> str:
+        return "udp" if self.protocol == "awg" else "tcp"
 
 
 @dataclass
@@ -515,6 +577,55 @@ class Database:
     async def delete_server(self, server_id: int) -> None:
         await self._exec("DELETE FROM servers WHERE id = ?", (server_id,))
 
+    # ---------- входы для белых списков ----------
+
+    async def relays(self) -> list[Relay]:
+        return await self._all(Relay, "SELECT * FROM relays ORDER BY is_main DESC, id")
+
+    async def get_relay(self, relay_id: int) -> Relay | None:
+        return await self._one(Relay, "SELECT * FROM relays WHERE id = ?", (relay_id,))
+
+    async def main_relay(self) -> Relay | None:
+        return await self._one(Relay, "SELECT * FROM relays WHERE is_main = 1 ORDER BY id LIMIT 1")
+
+    async def add_relay(self, name: str, host: str, conn: str) -> Relay:
+        is_main = 0 if await self.main_relay() else 1  # первый вход сразу основной
+        cur = await self.c.execute(
+            "INSERT INTO relays (name, host, conn, is_main, created_at) VALUES (?, ?, ?, ?, ?)",
+            (name, host, conn, is_main, now()),
+        )
+        await self.c.commit()
+        relay = await self.get_relay(cur.lastrowid)
+        assert relay
+        return relay
+
+    async def update_relay(self, relay_id: int, **fields) -> None:
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        await self._exec(f"UPDATE relays SET {sets} WHERE id = ?", (*fields.values(), relay_id))
+
+    async def set_main_relay(self, relay_id: int) -> None:
+        await self.c.execute("UPDATE relays SET is_main = (id = ?)", (relay_id,))
+        await self.c.commit()
+
+    async def delete_relay(self, relay_id: int) -> None:
+        await self.c.execute("DELETE FROM relay_ports WHERE relay_id = ?", (relay_id,))
+        await self.c.execute("DELETE FROM relays WHERE id = ?", (relay_id,))
+        await self.c.commit()
+
+    async def relay_ports(self, relay_id: int) -> list[RelayPort]:
+        return await self._all(
+            RelayPort, "SELECT * FROM relay_ports WHERE relay_id = ? ORDER BY server_id, protocol", (relay_id,)
+        )
+
+    async def set_relay_ports(self, relay_id: int, ports: list[RelayPort]) -> None:
+        await self.c.execute("DELETE FROM relay_ports WHERE relay_id = ?", (relay_id,))
+        await self.c.executemany(
+            """INSERT INTO relay_ports (relay_id, server_id, protocol, listen_port, target_ip, target_port)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            [(relay_id, p.server_id, p.protocol, p.listen_port, p.target_ip, p.target_port) for p in ports],
+        )
+        await self.c.commit()
+
     async def server_key_counts(self) -> dict[int, tuple[int, int, int]]:
         """server_id -> (всего ключей, включённых, онлайн за 3 мин)."""
         async with self.c.execute(
@@ -523,6 +634,18 @@ class Database:
             (now() - 180,),
         ) as cur:
             return {r[0]: (r[1], r[2] or 0, r[3] or 0) for r in await cur.fetchall()}
+
+    async def server_protocol_counts(self) -> dict[int, dict[str, tuple[int, int]]]:
+        """server_id -> {протокол: (устройств, онлайн за 3 мин)}."""
+        result: dict[int, dict[str, tuple[int, int]]] = {}
+        async with self.c.execute(
+            """SELECT server_id, protocol, COUNT(*), SUM(enabled = 1 AND last_handshake >= ?)
+               FROM keys GROUP BY server_id, protocol""",
+            (now() - 180,),
+        ) as cur:
+            for sid, proto, total, online in await cur.fetchall():
+                result.setdefault(sid, {})[proto] = (total, online or 0)
+        return result
 
     async def assign_orphan_keys(self, server_id: int) -> int:
         """Ключи из версии бота без мультисерверности привязываются к первому серверу."""
