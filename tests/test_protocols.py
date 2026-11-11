@@ -238,3 +238,92 @@ async def test_vless_client_tweaks(multi):  # noqa: F811
     json.dump(cfg, open(path, "w", encoding="utf-8"))
     q = params((await svc.render(key)).vpn_url)
     assert q["fp"] == "chrome" and q["mode"] == "auto"
+
+
+# Так Amnezia (5.x, ноябрь 2026) пишет xhttpSettings на сервер: вместе с обфускацией паддинга
+# и размещением сессии, которые клиент обязан повторить.
+AMNEZIA_XHTTP = {
+    "host": "www.googletagmanager.com",
+    "path": "/api/v2/sync7f3a",
+    "mode": "auto",
+    "sessionIDPlacement": "cookie",
+    "seqPlacement": "header",
+    "uplinkDataPlacement": "body",
+    "scMaxEachPostBytes": "1000000",
+    "xPaddingObfsMode": True,
+    "xPaddingBytes": "100-1000",
+    "xPaddingKey": "x_padding",
+    "xPaddingHeader": "X-Padding",
+    "xPaddingPlacement": "cookie",
+    "xPaddingMethod": "repeat-x",
+}
+
+
+async def test_vless_xhttp_matches_amnezia(multi):  # noqa: F811
+    import urllib.parse as up
+
+    from bot.awg.export import decode_vpn_url
+
+    svc = multi
+    de, *_ = await svc.db.servers()
+    user = await user_with_sub(svc)
+    key = (await svc.create_device(user, "Ноут", de.id, "vless")).key
+    path = os.path.join(de.conn[5:], "opt/amnezia/xray/server.json")
+    cfg = json.load(open(path, encoding="utf-8"))
+    stream = cfg["inbounds"][0]["streamSettings"]
+    stream["network"] = "xhttp"
+    stream["xhttpSettings"] = dict(AMNEZIA_XHTTP)
+    json.dump(cfg, open(path, "w", encoding="utf-8"))
+
+    rk = await svc.render(key)
+    # 1) ссылка vless:// для v2rayNG / Hiddify / Streisand — с параметром extra
+    q = dict(up.parse_qsl(up.urlparse(rk.vpn_url).query))
+    assert q["type"] == "xhttp" and q["path"] == "/api/v2/sync7f3a" and q["host"] == "www.googletagmanager.com"
+    assert q["mode"] == "stream-one" and q["fp"] == "firefox" and "flow" not in q
+    extra = json.loads(q["extra"])
+    assert extra["xPaddingObfsMode"] is True and extra["xPaddingPlacement"] == "cookie"
+    assert extra["sessionIDPlacement"] == "cookie" and extra["seqPlacement"] == "header"
+    assert not {"host", "path", "mode"} & set(extra)
+
+    # 2) ключ vpn:// для AmneziaVPN — полный конфиг клиента, как экспорт «для AmneziaVPN»
+    data = decode_vpn_url(rk.amnezia_url)
+    assert data["defaultContainer"] == "amnezia-xray" and data["hostName"] == de.host
+    xray = data["containers"][0]["xray"]
+    client = json.loads(xray["last_config"])
+    assert client["inbounds"][0]["protocol"] == "socks" and client["inbounds"][0]["port"] == 10808
+    out = client["outbounds"][0]
+    assert out["protocol"] == "vless"
+    vnext = out["settings"]["vnext"][0]
+    assert vnext["address"] == de.host and vnext["users"] == [{"id": key.public_key, "encryption": "none"}]
+    st = out["streamSettings"]
+    assert st["network"] == "xhttp" and st["security"] == "reality"
+    assert st["realitySettings"]["fingerprint"] == "firefox" and st["realitySettings"]["publicKey"]
+    xs = st["xhttpSettings"]
+    assert {k: xs[k] for k in AMNEZIA_XHTTP if k != "mode"} == {k: v for k, v in AMNEZIA_XHTTP.items() if k != "mode"}
+    assert xs["mode"] == "stream-one"
+
+    # 3) через вход для белых списков — тот же конфиг, но адрес и порт входа
+    await svc.add_relay("Москва", "7.7.7.7", f"mock:{os.path.join(os.path.dirname(path), 'relay')}")
+    wl = await svc.render(key, whitelist=True)
+    wl_out = json.loads(decode_vpn_url(wl.amnezia_url)["containers"][0]["xray"]["last_config"])["outbounds"][0]
+    assert wl_out["settings"]["vnext"][0]["address"] == "7.7.7.7"
+    assert "@7.7.7.7:" in wl.vpn_url and "extra=" in wl.vpn_url
+
+
+async def test_vless_tcp_has_amnezia_key(multi):  # noqa: F811
+    from bot.awg.export import decode_vpn_url
+
+    svc = multi
+    de, *_ = await svc.db.servers()
+    await svc.check_server(de)  # демо-сервер создаёт конфиг XRay
+    path = os.path.join(de.conn[5:], "opt/amnezia/xray/server.json")
+    cfg = json.load(open(path, encoding="utf-8"))
+    # как на сервере Amnezia: её собственный клиент с flow vision
+    cfg["inbounds"][0]["settings"]["clients"] = [{"id": "11111111-2222-3333-4444-555555555555", "flow": "xtls-rprx-vision"}]
+    json.dump(cfg, open(path, "w", encoding="utf-8"))
+    user = await user_with_sub(svc)
+    rk = await svc.create_device(user, "Телефон", de.id, "vless")
+    assert rk.amnezia_url.startswith("vpn://") and "extra=" not in rk.vpn_url
+    out = json.loads(decode_vpn_url(rk.amnezia_url)["containers"][0]["xray"]["last_config"])["outbounds"][0]
+    assert out["streamSettings"]["network"] == "tcp" and "xhttpSettings" not in out["streamSettings"]
+    assert out["settings"]["vnext"][0]["users"][0]["flow"] == "xtls-rprx-vision"

@@ -167,3 +167,30 @@ def decode_vpn_url(url: str) -> dict:
 
 def build_vpn_url(p: ClientParams) -> str:
     return encode_vpn_url(build_amnezia_json(p))
+
+
+def build_xray_vpn_url(client_config: dict, host: str, port: int, description: str, dns1: str = "", dns2: str = "") -> str:
+    """Ключ vpn:// с XRay для приложения AmneziaVPN: полный конфиг клиента в last_config
+    (так же, как экспорт «для AmneziaVPN» в самом приложении)."""
+    container = "amnezia-xray"
+    config: dict = {
+        "containers": [
+            {
+                "container": container,
+                "xray": {
+                    "last_config": json.dumps(client_config, ensure_ascii=False, separators=(",", ":")),
+                    "port": str(port),
+                    "transport_proto": "tcp",
+                },
+            }
+        ],
+        "defaultContainer": container,
+        "description": description or host,
+        "hostName": host,
+        "format_version": CONFIG_FORMAT_VERSION,
+    }
+    if dns1:
+        config["dns1"] = dns1
+    if dns2:
+        config["dns2"] = dns2
+    return encode_vpn_url(config)

@@ -164,18 +164,29 @@ async def deliver_key(bot: Bot, chat_id: int, rk: RenderedKey) -> None:
             "и включайте, когда обычное не работает.\n\n"
         )
     if rk.is_vless:
+        if rk.amnezia_url:
+            # Для AmneziaVPN — полный конфиг (как экспорт «для AmneziaVPN» в самом приложении)
+            await bot.send_message(
+                chat_id,
+                header
+                + "📱 <b>AmneziaVPN / DefaultVPN</b> — скопируйте ключ (нажмите на него) и вставьте: "
+                "«Добавить сервер» → «Вставить ключ»:\n\n"
+                f"<code>{esc(rk.amnezia_url)}</code>",
+            )
+            header = ""
         await bot.send_message(
             chat_id,
             header
-            + "Скопируйте ссылку (нажмите на неё) и добавьте в приложение:\n"
-            "• <b>AmneziaVPN</b> / <b>DefaultVPN</b> — «Добавить сервер» → «Вставить ключ»;\n"
+            + "🔗 <b>Другие приложения</b> — скопируйте ссылку и добавьте:\n"
             "• <b>v2rayNG</b> (Android) — ➕ → «Импорт из буфера обмена»;\n"
             "• <b>Hiddify</b>, <b>Streisand</b>, <b>FoXray</b> (iPhone) — ➕ → «Из буфера обмена».\n\n"
             f"<code>{esc(rk.vpn_url)}</code>",
         )
         png = rk.qr_png()
         if png:
-            await bot.send_photo(chat_id, BufferedInputFile(png, filename="qr.png"), caption="QR-код для сканирования")
+            await bot.send_photo(
+                chat_id, BufferedInputFile(png, filename="qr.png"), caption="QR-код ссылки для других приложений"
+            )
         return
     instruction = (
         "Скопируйте ключ (нажмите на него) и вставьте в AmneziaVPN → «Добавить сервер» → «Вставить ключ».\n"
