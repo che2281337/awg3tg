@@ -618,8 +618,18 @@ class VpnService:
             whitelist=via is not None,
         )
 
+    def _client_xray(self, info):
+        """Клиентские параметры ссылки, которых нет в конфиге сервера: отпечаток TLS и режим XHTTP."""
+        s = self.settings
+        if s.xray_fingerprint and info.security in ("reality", "tls"):
+            info = replace(info, fingerprint=s.xray_fingerprint)
+        if info.network == "xhttp" and s.xhttp_mode and info.mode in ("", "auto"):
+            info = replace(info, mode=s.xhttp_mode)  # сервер в auto принимает любой режим
+        return info
+
     def _rendered_vless(self, key: Key, row: Server, info, via: tuple[Relay, RelayPort] | None = None) -> RenderedKey:
         label = f"{self.settings.server_name} {row.title} {key.name}"
+        info = self._client_xray(info)
         host = row.host
         if via:
             label += f" {WHITELIST_SUFFIX}"

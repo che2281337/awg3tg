@@ -514,7 +514,7 @@ async def test_vless_device(svc, fake_container):
     assert url.hostname == "203.0.113.10" and url.port == 443
     assert q == {
         "type": "tcp", "encryption": "none", "security": "reality", "flow": "xtls-rprx-vision",
-        "sni": "www.googletagmanager.com", "fp": "chrome", "pbk": XRAY_PUB, "sid": XRAY_SID,
+        "sni": "www.googletagmanager.com", "fp": "firefox", "pbk": XRAY_PUB, "sid": XRAY_SID,
     }
     cfg = xray_conf(fake_container)
     client = cfg["inbounds"][0]["settings"]["clients"][-1]

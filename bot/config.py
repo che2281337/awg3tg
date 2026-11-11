@@ -72,6 +72,13 @@ class Settings:
     # только если задан PAYMENT_DETAILS)
     manual_payments: bool = True
 
+    # VLESS: отпечаток TLS-клиента в ссылках (fp=). chrome ТСПУ распознаёт чаще всего.
+    # Пусто — как указано в настройках сервера (обычно chrome).
+    xray_fingerprint: str = "firefox"
+    # VLESS XHTTP: режим для ссылок, если на сервере mode = auto или не задан.
+    # stream-one — всё одним соединением (меньше TLS-рукопожатий). Пусто — как на сервере.
+    xhttp_mode: str = "stream-one"
+
     # За сколько дней до конца подписки напоминать (каждый порог — одно сообщение)
     remind_days: tuple[int, ...] = (3, 2, 1)
 
@@ -116,6 +123,8 @@ class Settings:
             default_devices=_int("DEFAULT_DEVICES", 1),
             slot_price=max(0, _int("SLOT_PRICE", 100)),
             slot_days=max(1, min(_int("SLOT_DAYS", 30), 3650)),
+            xray_fingerprint=os.getenv("XRAY_FINGERPRINT", "firefox").strip().lower(),
+            xhttp_mode=os.getenv("XHTTP_MODE", "stream-one").strip().lower(),
             remind_days=_remind_days(os.getenv("REMIND_DAYS", "")),
             stats_interval=max(60, _int("STATS_INTERVAL", 300)),
             backup_hours=max(0, _int("BACKUP_HOURS", 24)),
