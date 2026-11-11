@@ -202,3 +202,39 @@ async def test_confirm_tap(monkeypatch):
     monkeypatch.setattr(common, "CONFIRM_WINDOW", -1)
     assert await common.confirm_tap(FakeCall(data="y"), "?") is False
     assert await common.confirm_tap(FakeCall(data="y"), "?") is False
+
+
+async def test_vless_client_tweaks(multi):  # noqa: F811
+    """Ссылки VLESS: отпечаток firefox вместо chrome, XHTTP в auto → stream-one, явный режим сервера — как есть."""
+    import urllib.parse as up
+
+    svc = multi
+    de, *_ = await svc.db.servers()
+    user = await user_with_sub(svc)
+    key = (await svc.create_device(user, "Ноут", de.id, "vless")).key
+
+    def params(url):
+        return dict(up.parse_qsl(up.urlparse(url).query))
+
+    q = params((await svc.render(key)).vpn_url)
+    assert q["fp"] == "firefox" and q["type"] == "tcp" and "mode" not in q
+
+    path = os.path.join(de.conn[5:], "opt/amnezia/xray/server.json")
+    cfg = json.load(open(path, encoding="utf-8"))
+    stream = cfg["inbounds"][0]["streamSettings"]
+    stream["network"] = "xhttp"
+    stream["xhttpSettings"] = {"path": "/api/v2/sync", "mode": "auto"}
+    json.dump(cfg, open(path, "w", encoding="utf-8"))
+    q = params((await svc.render(key)).vpn_url)
+    assert q["type"] == "xhttp" and q["mode"] == "stream-one" and q["path"] == "/api/v2/sync" and "flow" not in q
+
+    stream["xhttpSettings"]["mode"] = "packet-up"  # режим задан на сервере явно — клиент обязан совпасть
+    json.dump(cfg, open(path, "w", encoding="utf-8"))
+    assert params((await svc.render(key)).vpn_url)["mode"] == "packet-up"
+
+    svc.settings.xray_fingerprint = ""  # пусто — как в настройках сервера
+    svc.settings.xhttp_mode = ""
+    stream["xhttpSettings"]["mode"] = "auto"
+    json.dump(cfg, open(path, "w", encoding="utf-8"))
+    q = params((await svc.render(key)).vpn_url)
+    assert q["fp"] == "chrome" and q["mode"] == "auto"
