@@ -122,15 +122,28 @@ def build_vless_url(info: XrayInfo, host: str, client_id: str, name: str) -> str
             params["host"] = info.host
         if info.mode:
             params["mode"] = info.mode
-        if info.xhttp_extra:
-            # Стандартный параметр ссылок Xray для остальных настроек XHTTP
-            params["extra"] = json.dumps(info.xhttp_extra, ensure_ascii=False, separators=(",", ":"))
+        # Стандартный параметр ссылок Xray для остальных настроек XHTTP
+        extra = {k: v for k, v in xhttp_client_settings(info).items() if k not in ("host", "path", "mode")}
+        params["extra"] = json.dumps(extra, ensure_ascii=False, separators=(",", ":"))
     addr = f"[{host}]" if ":" in host and not host.startswith("[") else host
     query = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
     return f"vless://{client_id}@{addr}:{info.port}?{query}#{urllib.parse.quote(name)}"
 
 
 LOCAL_SOCKS_PORT = 10808  # как в приложении Amnezia
+
+# Клиентские поля XHTTP, которых нет в конфиге сервера: приложение Amnezia всегда ставит их
+# клиенту с такими значениями по умолчанию (protocolConstants.h).
+XHTTP_CLIENT_DEFAULTS = {"uplinkHTTPMethod": "POST", "scMinPostsIntervalMs": "100-800"}
+
+
+def xhttp_client_settings(info: XrayInfo) -> dict:
+    """xhttpSettings для клиента — как их собирает приложение Amnezia."""
+    xs = {**XHTTP_CLIENT_DEFAULTS, **info.xhttp_extra}
+    for key in ("host", "path", "mode"):
+        if getattr(info, key):
+            xs[key] = getattr(info, key)
+    return xs
 
 
 def build_client_config(info: XrayInfo, host: str, client_id: str) -> dict:
@@ -153,11 +166,7 @@ def build_client_config(info: XrayInfo, host: str, client_id: str) -> dict:
             tls["alpn"] = info.alpn.split(",")
         stream["tlsSettings"] = tls
     if info.network == "xhttp":
-        xs = dict(info.xhttp_extra)
-        for key in ("host", "path", "mode"):
-            if getattr(info, key):
-                xs[key] = getattr(info, key)
-        stream["xhttpSettings"] = xs
+        stream["xhttpSettings"] = xhttp_client_settings(info)
     return {
         "log": {"loglevel": "error"},
         "inbounds": [{"listen": "127.0.0.1", "port": LOCAL_SOCKS_PORT, "protocol": "socks", "settings": {"udp": True}}],
