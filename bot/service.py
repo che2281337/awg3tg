@@ -15,12 +15,12 @@ from dataclasses import dataclass, replace
 
 import segno
 
-from .awg.export import ClientParams, build_native_config, build_vpn_url
+from .awg.export import ClientParams, build_native_config, build_vpn_url, build_xray_vpn_url
 from .awg.mock import MockAwgServer, MockXrayServer
 from .awg.relay import Forward, MockRelay, RelayClient, allocate_ports
 from .awg.runner import LocalRunner, Runner, SshKeyStore, SshRunner, parse_ssh_target
 from .awg.server import AwgError, AwgServer, ServerInfo
-from .awg.xray import XrayServer, build_vless_url, new_client_id
+from .awg.xray import XrayServer, build_client_config, build_vless_url, new_client_id
 from .config import Settings
 from .db import PROTOCOLS, Database, Key, Payment, Plan, Relay, RelayPort, Server, User, now
 from .utils import today
@@ -55,6 +55,7 @@ class RenderedKey:
     server_name: str = "awg"
     location: str = ""
     whitelist: bool = False  # ключ через входной сервер в РФ (для белых списков)
+    amnezia_url: str = ""  # VLESS: ключ vpn:// с полным конфигом для приложения AmneziaVPN
 
     @property
     def is_vless(self) -> bool:
@@ -635,7 +636,17 @@ class VpnService:
             label += f" {WHITELIST_SUFFIX}"
             host, info = via[0].host, replace(info, port=via[1].listen_port)
         url = build_vless_url(info, host, key.public_key, label)
-        return RenderedKey(key, url, "", self.settings.server_name, row.title, whitelist=via is not None)
+        amnezia = build_xray_vpn_url(
+            build_client_config(info, host, key.public_key),
+            host,
+            info.port,
+            f"{self.settings.server_name} {row.title}" + (f" {WHITELIST_SUFFIX}" if via else ""),
+            self.settings.dns1,
+            self.settings.dns2,
+        )
+        return RenderedKey(
+            key, url, "", self.settings.server_name, row.title, whitelist=via is not None, amnezia_url=amnezia
+        )
 
     async def render(self, key: Key, whitelist: bool = False) -> RenderedKey:
         """whitelist=True — тот же ключ, но через основной входной сервер (для белых списков)."""

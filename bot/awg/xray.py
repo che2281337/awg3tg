@@ -15,7 +15,7 @@ import json
 import logging
 import urllib.parse
 import uuid as uuidlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .server import AwgError, ContainerClient
 
@@ -44,6 +44,9 @@ class XrayInfo:
     path: str = ""
     host: str = ""
     mode: str = ""
+    # Остальные настройки XHTTP сервера (паддинг, где передаётся сессия и т.п.) — клиент обязан
+    # повторить их, иначе сервер отвергает запросы: рукопожатие Reality есть, а данных нет.
+    xhttp_extra: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -93,6 +96,7 @@ def parse_info(cfg: dict, public_key: str = "", short_id: str = "") -> XrayInfo:
         info.path = xs.get("path", "")
         info.host = xs.get("host", "")
         info.mode = xs.get("mode", "")
+        info.xhttp_extra = {k: v for k, v in xs.items() if k not in ("path", "host", "mode")}
     return info
 
 
@@ -118,9 +122,62 @@ def build_vless_url(info: XrayInfo, host: str, client_id: str, name: str) -> str
             params["host"] = info.host
         if info.mode:
             params["mode"] = info.mode
+        # Стандартный параметр ссылок Xray для остальных настроек XHTTP
+        extra = {k: v for k, v in xhttp_client_settings(info).items() if k not in ("host", "path", "mode")}
+        params["extra"] = json.dumps(extra, ensure_ascii=False, separators=(",", ":"))
     addr = f"[{host}]" if ":" in host and not host.startswith("[") else host
     query = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
     return f"vless://{client_id}@{addr}:{info.port}?{query}#{urllib.parse.quote(name)}"
+
+
+LOCAL_SOCKS_PORT = 10808  # как в приложении Amnezia
+
+# Клиентские поля XHTTP, которых нет в конфиге сервера: приложение Amnezia всегда ставит их
+# клиенту с такими значениями по умолчанию (protocolConstants.h).
+XHTTP_CLIENT_DEFAULTS = {"uplinkHTTPMethod": "POST", "scMinPostsIntervalMs": "100-800"}
+
+
+def xhttp_client_settings(info: XrayInfo) -> dict:
+    """xhttpSettings для клиента — как их собирает приложение Amnezia."""
+    xs = {**XHTTP_CLIENT_DEFAULTS, **info.xhttp_extra}
+    for key in ("host", "path", "mode"):
+        if getattr(info, key):
+            xs[key] = getattr(info, key)
+    return xs
+
+
+def build_client_config(info: XrayInfo, host: str, client_id: str) -> dict:
+    """Полный конфиг Xray клиента — так его собирает приложение Amnezia (socks-вход + VLESS-выход)."""
+    user: dict = {"id": client_id, "encryption": "none"}
+    if info.flow:
+        user["flow"] = info.flow
+    stream: dict = {"network": info.network, "security": info.security}
+    if info.security == "reality":
+        stream["realitySettings"] = {
+            "serverName": info.sni,
+            "fingerprint": info.fingerprint or "chrome",
+            "publicKey": info.public_key,
+            "shortId": info.short_id,
+            "spiderX": "",
+        }
+    elif info.security == "tls":
+        tls: dict = {"serverName": info.sni, "fingerprint": info.fingerprint or "chrome"}
+        if info.alpn:
+            tls["alpn"] = info.alpn.split(",")
+        stream["tlsSettings"] = tls
+    if info.network == "xhttp":
+        stream["xhttpSettings"] = xhttp_client_settings(info)
+    return {
+        "log": {"loglevel": "error"},
+        "inbounds": [{"listen": "127.0.0.1", "port": LOCAL_SOCKS_PORT, "protocol": "socks", "settings": {"udp": True}}],
+        "outbounds": [
+            {
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": host, "port": info.port, "users": [user]}]},
+                "streamSettings": stream,
+            }
+        ],
+    }
 
 
 def ensure_stats_api(cfg: dict) -> bool:
