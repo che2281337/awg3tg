@@ -21,6 +21,7 @@ from .awg.relay import Forward, MockRelay, RelayClient, allocate_ports
 from .awg.runner import LocalRunner, Runner, SshKeyStore, SshRunner, parse_ssh_target
 from .awg.server import AwgError, AwgServer, ServerInfo
 from .awg.xray import XrayServer, build_client_config, build_vless_url, new_client_id
+from .awg.xui import AutoAwg, AutoVless
 from .config import Settings
 from .db import PROTOCOLS, Database, Key, Payment, Plan, Relay, RelayPort, Server, User, now
 from .utils import today
@@ -138,7 +139,7 @@ class ServerPool:
         self.ssh = SshKeyStore(os.path.join(os.path.dirname(settings.db_path) or ".", "ssh"))
         self._local = local
         self._runners: dict[int, Runner] = {}
-        self._clients: dict[tuple[int, str], AwgServer | XrayServer] = {}
+        self._clients: dict[tuple[int, str], AwgServer | XrayServer | AutoAwg | AutoVless] = {}
         self._locks: dict[tuple[int, str], asyncio.Lock] = {}
 
     def _runner(self, row: Server) -> Runner:
@@ -153,7 +154,7 @@ class ServerPool:
                 self._runners[row.id] = runner
         return runner
 
-    def make(self, row: Server, protocol: str) -> AwgServer | XrayServer:
+    def make(self, row: Server, protocol: str) -> AwgServer | XrayServer | AutoAwg | AutoVless:
         s = self.settings
         if row.conn.startswith("mock:"):
             return MockAwgServer(row.conn[5:]) if protocol == "awg" else MockXrayServer(row.conn[5:])
@@ -169,8 +170,9 @@ class ServerPool:
                     binary=s.awg_bin,
                     runner=runner,
                 )
-            return AwgServer(container=row.container, runner=runner)
-        return XrayServer(runner=runner)
+            # контейнер Amnezia или панель 3x-ui — что найдётся на сервере
+            return AutoAwg(runner, row.container)
+        return AutoVless(runner)
 
     async def get(self, row: Server, protocol: str = "awg"):
         k = (row.id, protocol)
@@ -412,7 +414,9 @@ class VpnService:
         probe = Server(0, name, flag, host, conn, container, 1, 0, now(), 1, None, 0, "")
         protocols, error = await self._probe(probe)
         if not protocols:
-            raise ServiceError(f"Не удалось подключиться к серверу или на нём нет AmneziaWG / XRay: {error}")
+            raise ServiceError(
+                f"Не удалось подключиться к серверу или на нём нет AmneziaWG / XRay / 3x-ui: {error}"
+            )
         row = await self.db.add_server(name, flag, host, conn, container)
         await self._mark(row, True, "", protocols)
         row = await self.db.get_server(row.id)
@@ -443,12 +447,15 @@ class VpnService:
                     from .awg.conf import protocol_version
 
                     ver = protocol_version(info.awg_params) or "1.0"
-                    details[proto] = f"v{ver}, порт {info.port}, пиров {len(cfg.peers)}, онлайн {online}"
+                    backend = "3x-ui, " if getattr(client, "backend", "") == "3x-ui" else ""
+                    details[proto] = f"{backend}v{ver}, порт {info.port}, пиров {len(cfg.peers)}, онлайн {online}"
                 else:
                     cfg = await client.load_config()
                     xi = await client.info(cfg)
+                    backend = getattr(client, "backend", "")
                     details[proto] = (
-                        f"{xi.network}/{xi.security}, порт {xi.port}, SNI {xi.sni or '—'}, "
+                        (f"{backend}, " if backend == "3x-ui" else "")
+                        + f"{xi.network}/{xi.security}, порт {xi.port}, SNI {xi.sni or '—'}, "
                         f"клиентов {len(client.client_ids(cfg))}"
                     )
             except (AwgError, ServiceError) as e:
@@ -603,7 +610,7 @@ class VpnService:
             subnet_cidr=info.subnet_cidr,
             # Так сервер будет подписан в приложении AmneziaVPN: «MyVPN 🇩🇪 Германия»
             description=f"{self.settings.server_name} {row.title}{suffix}",
-            mtu=self.settings.client_mtu,
+            mtu=self.settings.client_mtu or info.mtu,
         )
 
     def _rendered_awg(

@@ -54,6 +54,7 @@ class ServerInfo:
     awg_params: dict[str, str]
     subnet_address: str
     subnet_cidr: str
+    mtu: str | None = None  # MTU для клиента, если его задаёт сервер (3x-ui); у Amnezia — нет
 
 
 @dataclass
