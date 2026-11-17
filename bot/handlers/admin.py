@@ -1226,7 +1226,8 @@ async def cb_server_resetkey(call: CallbackQuery, callback_data: ASrv, db: Datab
 def _ssh_help(pubkey: str) -> str:
     return (
         "➕ <b>Добавление сервера</b>\n\n"
-        "1. Установите на сервер AmneziaWG и/или XRay (VLESS) через приложение AmneziaVPN (как обычно).\n"
+        "1. Установите на сервер AmneziaWG и/или XRay (VLESS) через приложение AmneziaVPN (как обычно) "
+        "или панель 3x-ui с VLESS-подключением (inbound).\n"
         "2. Разрешите боту вход по SSH — выполните на этом сервере одну команду:\n"
         f"<pre>mkdir -p ~/.ssh &amp;&amp; echo '{esc(pubkey)}' &gt;&gt; ~/.ssh/authorized_keys</pre>\n"
         "3. Отправьте сюда строку:\n"
@@ -1236,7 +1237,8 @@ def _ssh_help(pubkey: str) -> str:
         "<code>Нидерланды | 🇳🇱 | 5.6.7.8 | admin@5.6.7.8:2222</code>\n"
         "(у не-root пользователя должен быть sudo без пароля для docker).\n\n"
         "Для сервера, на котором запущен сам бот, укажите <code>local</code>:\n"
-        "<code>Германия | 🇩🇪 | 1.2.3.4 | local</code>\n\n"
+        "<code>Германия | 🇩🇪 | 1.2.3.4 | local</code>\n"
+        "(для 3x-ui на сервере с ботом используйте SSH-подключение, а не <code>local</code>).\n\n"
         "Отмена — /cancel"
     )
 
