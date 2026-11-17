@@ -1227,7 +1227,7 @@ def _ssh_help(pubkey: str) -> str:
     return (
         "➕ <b>Добавление сервера</b>\n\n"
         "1. Установите на сервер AmneziaWG и/или XRay (VLESS) через приложение AmneziaVPN (как обычно) "
-        "или панель 3x-ui с VLESS-подключением (inbound).\n"
+        "или панель 3x-ui с подключением (inbound) VLESS и/или AmneziaWG.\n"
         "2. Разрешите боту вход по SSH — выполните на этом сервере одну команду:\n"
         f"<pre>mkdir -p ~/.ssh &amp;&amp; echo '{esc(pubkey)}' &gt;&gt; ~/.ssh/authorized_keys</pre>\n"
         "3. Отправьте сюда строку:\n"
